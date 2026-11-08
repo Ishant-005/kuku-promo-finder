@@ -1,0 +1,17 @@
+# Confidential input pack — never commit
+data/
+*.zip
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+
+# Raw outputs go to Drive, not the repo (uncomment if they quote too much script)
+# outputs/
