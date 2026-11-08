@@ -15,3 +15,7 @@ __pycache__/
 
 # Raw outputs go to Drive, not the repo (uncomment if they quote too much script)
 outputs/
+
+# Brief PDF and private notes
+docs/
+notes/
