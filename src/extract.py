@@ -20,7 +20,12 @@ from .models import (
 PROMPT_PATH = config.ROOT / "prompts" / "extract.md"
 TEXT_MAX = 160
 MIN_S, MAX_S = 20.0, 60.0
-HOOK_KINDS = {BeatKind.ACTION, BeatKind.DIALOGUE}
+# Only OTHER (SOUND FX in the source format) may not open a clip. CAMERA beats
+# are allowed: in these scripts they often carry the physical event.
+BANNED_FIRST_KINDS = {BeatKind.OTHER}
+# Beats that may run across a segment START (ambient camera shots may).
+NO_SPLIT_AT_START = {BeatKind.ACTION, BeatKind.DIALOGUE}
+EPS = 1e-6
 
 # Reject reasons (stable strings: run.py summarises by these)
 R_MALFORMED = "malformed"
@@ -29,6 +34,7 @@ R_UNKNOWN_ID = "unknown_id"
 R_BAD_SEGMENT = "bad_segment"
 R_ORDER = "out_of_order_or_overlap"
 R_FIRST_BEAT = "bad_first_beat"
+R_MID_BEAT = "cuts_mid_beat"
 R_SHORT = "too_short"
 R_LONG = "too_long"
 
@@ -131,8 +137,8 @@ def validate_candidate(cand: LLMCandidate, episode: Episode, candidate_id: str) 
             return reject(f"{R_ORDER}: segment {k + 1} starts at or before end of segment {k}")
 
     first = episode.beats[spans[0][0]]
-    if first.kind not in HOOK_KINDS:
-        return reject(f"{R_FIRST_BEAT}: {first.kind.value}")
+    if first.kind in BANNED_FIRST_KINDS:
+        return reject(f"{R_FIRST_BEAT}: {first.kind.value} (SOUND FX)")
 
     resolved: list[ResolvedSegment] = []
     for k, (i, j) in enumerate(spans):
@@ -149,6 +155,10 @@ def validate_candidate(cand: LLMCandidate, episode: Episode, candidate_id: str) 
         if resolved[k].start_s < resolved[k - 1].end_s:
             return reject(f"{R_ORDER}: segment {k + 1} overlaps segment {k} in time")
 
+    mid = _mid_beat_cut(resolved, episode)
+    if mid:
+        return reject(f"{R_MID_BEAT}: {mid}")
+
     out.segments_resolved = resolved
     out.duration_s = round(sum(r.end_s - r.start_s for r in resolved), 2)
     if out.duration_s < MIN_S:
@@ -156,6 +166,22 @@ def validate_candidate(cand: LLMCandidate, episode: Episode, candidate_id: str) 
     if out.duration_s > MAX_S:
         return reject(f"{R_LONG}: {out.duration_s:.1f}s")
     return out
+
+
+def _mid_beat_cut(resolved: list[ResolvedSegment], episode: Episode) -> str | None:
+    """Time-based check against ALL beats in the episode (not just the id range):
+    - any beat starting inside a segment must end by the segment end;
+    - an ACTION/DIALOGUE beat starting before a segment start must end by it."""
+    for k, seg in enumerate(resolved, 1):
+        for b in episode.beats:
+            if seg.start_s - EPS <= b.start_s < seg.end_s - EPS and b.end_s > seg.end_s + EPS:
+                return (f"{b.id} ({b.kind.value} {b.start_s:.2f}-{b.end_s:.2f}) runs past "
+                        f"segment {k} end {seg.end_s:.2f}")
+            if (b.kind in NO_SPLIT_AT_START
+                    and b.start_s < seg.start_s - EPS and b.end_s > seg.start_s + EPS):
+                return (f"{b.id} ({b.kind.value} {b.start_s:.2f}-{b.end_s:.2f}) is cut by "
+                        f"segment {k} start {seg.start_s:.2f}")
+    return None
 
 
 def validate_response(raw: str, episode: Episode) -> ExtractionResult:

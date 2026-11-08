@@ -38,7 +38,7 @@ FAKE = {
         {**_cand([(2, 7)]), "segments": [{"start_id": "e007-b002", "end_id": "e007-b099"}]},  # c3
         _cand([(6, 9), (2, 4)]),                            # c4 out of order
         _cand([(2, 6), (5, 9)]),                            # c5 overlap
-        _cand([(1, 6)]),                                    # c6 starts on CAMERA
+        _cand([(1, 6)]),                                    # c6 starts on CAMERA: ok, 30s
         _cand([(5, 10)]),                                   # c7 starts on SOUND FX (OTHER)
         _cand([(2, 4)]),                                    # c8 15s too short
         _cand([(2, 12)]),                                   # c9 55s ok
@@ -64,7 +64,8 @@ def _by_id(result):
 
 def test_accepted_resolve_timestamps(result):
     acc = {c.candidate_id for c in result.accepted}
-    assert acc == {"e007-c1", "e007-c2", "e007-c9", "e007-c10", "e007-c14", "e007-c15"}
+    assert acc == {"e007-c1", "e007-c2", "e007-c6", "e007-c9", "e007-c10", "e007-c14",
+                   "e007-c15"}
     c = _by_id(result)
     assert c["e007-c1"].duration_s == 30.0
     assert [(s.start_s, s.end_s) for s in c["e007-c1"].segments_resolved] == [(5.0, 35.0)]
@@ -79,7 +80,6 @@ def test_accepted_resolve_timestamps(result):
     ("e007-c3", extract.R_UNKNOWN_ID),
     ("e007-c4", extract.R_ORDER),
     ("e007-c5", extract.R_ORDER),
-    ("e007-c6", extract.R_FIRST_BEAT),
     ("e007-c7", extract.R_FIRST_BEAT),
     ("e007-c8", extract.R_SHORT),
     ("e007-c11", extract.R_BAD_SEGMENT),
@@ -135,7 +135,7 @@ def test_hook_type_coercion(result):
 ])
 def test_tolerant_json(wrap):
     res = extract.validate_response(wrap(json.dumps(FAKE)), _ep())
-    assert len(res.accepted) == 6
+    assert len(res.accepted) == 7
 
 
 @pytest.mark.parametrize("raw", ["not json at all", "[1, 2]", '{"candidates": "nope"}'])
@@ -181,5 +181,71 @@ def test_extract_episode_uses_prompt_file_and_writes(monkeypatch, tmp_path):
     path = extract.write_result(res, tmp_path)
     assert path == tmp_path / "episodes" / "ep007.json"
     data = json.loads(path.read_text())
-    assert data["episode"] == 7 and len(data["accepted"]) == 6
+    assert data["episode"] == 7 and len(data["accepted"]) == 7
     assert {"accepted", "rejected", "episode_note", "model"} <= data.keys()
+
+
+# --- first-beat rule: only SOUND FX (kind OTHER) is banned -------------------
+
+def test_camera_first_beat_allowed_sound_fx_banned():
+    res = extract.validate_response(
+        json.dumps({"candidates": [_cand([(1, 6)]), _cand([(5, 10)])]}), _ep())
+    assert [c.candidate_id for c in res.accepted] == ["e007-c1"]
+    assert res.rejected[0].reject_reason.startswith(extract.R_FIRST_BEAT)
+    assert "OTHER" in res.rejected[0].reject_reason
+
+
+# --- cuts_mid_beat ------------------------------------------------------------
+
+def _one(ep, segments):
+    res = extract.validate_response(json.dumps({"candidates": [_cand(segments)]}), ep)
+    return (res.accepted + res.rejected)[0]
+
+
+def _shift(ep, n, **upd):
+    ep.beats[n - 1] = ep.beats[n - 1].model_copy(update=upd)
+
+
+def test_mid_beat_dialogue_after_end_id_starts_before_cut():
+    # The ep10 case: next line starts 0.2 s before the segment end and runs past it.
+    ep = _ep()
+    _shift(ep, 8, kind=BeatKind.DIALOGUE, start_s=34.8, end_s=37.0)
+    c = _one(ep, [(2, 7)])                       # segment 5.0-35.0
+    assert c.reject_reason.startswith(extract.R_MID_BEAT), c.reject_reason
+    assert "e007-b008" in c.reject_reason and "end" in c.reject_reason
+
+
+def test_mid_beat_any_kind_starting_inside_counts():
+    ep = _ep()
+    _shift(ep, 10, start_s=44.0, end_s=52.0)    # CAMERA starts inside 5-45, ends after
+    c = _one(ep, [(2, 9)])
+    assert c.reject_reason.startswith(extract.R_MID_BEAT)
+    assert "e007-b010" in c.reject_reason
+
+
+def test_mid_beat_dialogue_spanning_segment_start():
+    ep = _ep()
+    _shift(ep, 2, end_s=12.0)                    # DIALOGUE 5-12, segment starts at 10
+    c = _one(ep, [(3, 8)])
+    assert c.reject_reason.startswith(extract.R_MID_BEAT)
+    assert "e007-b002" in c.reject_reason and "start" in c.reject_reason
+
+
+def test_mid_beat_second_segment_start_checked():
+    ep = _ep()
+    _shift(ep, 6, kind=BeatKind.ACTION, start_s=25.0, end_s=37.0)  # spans b007 start (30)
+    c = _one(ep, [(2, 4), (7, 11)])
+    assert c.reject_reason.startswith(extract.R_MID_BEAT)
+    assert "segment 2 start" in c.reject_reason
+
+
+def test_camera_spanning_segment_start_is_allowed():
+    ep = _ep()
+    _shift(ep, 1, end_s=12.0)                    # CAMERA 0-12 runs over the 5.0 start
+    c = _one(ep, [(2, 7)])
+    assert c.reject_reason is None, c.reject_reason
+
+
+def test_back_to_back_beats_are_not_mid_beat():
+    c = _one(_ep(), [(2, 7)])                    # b008 starts exactly at 35.0
+    assert c.reject_reason is None
