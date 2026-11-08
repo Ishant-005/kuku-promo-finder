@@ -23,8 +23,12 @@ MIN_S, MAX_S = 20.0, 60.0
 # Only OTHER (SOUND FX in the source format) may not open a clip. CAMERA beats
 # are allowed: in these scripts they often carry the physical event.
 BANNED_FIRST_KINDS = {BeatKind.OTHER}
-# Beats that may run across a segment START (ambient camera shots may).
-NO_SPLIT_AT_START = {BeatKind.ACTION, BeatKind.DIALOGUE}
+# Only spoken lines may not be cut by a segment boundary. CAMERA, ACTION and
+# SOUND FX beats may run across a segment start or end.
+NO_SPLIT_KINDS = {BeatKind.DIALOGUE}
+# A dialogue beat may stick out past a boundary by up to this much (timing slop
+# in the source timestamps; 0.3 s is below a syllable).
+MID_BEAT_TOL_S = 0.3
 EPS = 1e-6
 
 # Reject reasons (stable strings: run.py summarises by these)
@@ -37,6 +41,12 @@ R_FIRST_BEAT = "bad_first_beat"
 R_MID_BEAT = "cuts_mid_beat"
 R_SHORT = "too_short"
 R_LONG = "too_long"
+R_DUPLICATE = "duplicate_of"
+
+# Dedupe: same weights as the ranking score, so "higher-scoring" means the same
+# thing everywhere. Ties keep the candidate the LLM listed first.
+SCORE_W = (0.40, 0.35, 0.25)  # hook, cliff, standalone
+DUP_OVERLAP_FRAC = 0.5
 
 
 class ExtractionError(Exception):
@@ -53,12 +63,17 @@ def _trim(text: str, n: int = TEXT_MAX) -> str:
 
 
 def build_beat_table(episode: Episode) -> str:
-    """One line per beat: id | kind | speaker | start | end | text."""
-    lines = ["id | kind | speaker | start | end | text"]
+    """One line per beat: id | kind | speaker | start | end | cum_start | cum_end | text.
+
+    Times are seconds, one decimal. cum_* = seconds elapsed since the first
+    beat's start, so a clip's span = cum_end(last beat) - cum_start(first beat)."""
+    lines = ["id | kind | speaker | start | end | cum_start | cum_end | text"]
+    t0 = min((b.start_s for b in episode.beats), default=0.0)
     for b in episode.beats:
         lines.append(
             f"{b.id} | {b.kind.value} | {b.speaker or '-'} | "
-            f"{b.start_s:.2f} | {b.end_s:.2f} | {_trim(b.text)}"
+            f"{b.start_s:.1f} | {b.end_s:.1f} | {b.start_s - t0:.1f} | {b.end_s - t0:.1f} | "
+            f"{_trim(b.text)}"
         )
     return "\n".join(lines)
 
@@ -155,12 +170,14 @@ def validate_candidate(cand: LLMCandidate, episode: Episode, candidate_id: str) 
         if resolved[k].start_s < resolved[k - 1].end_s:
             return reject(f"{R_ORDER}: segment {k + 1} overlaps segment {k} in time")
 
+    # Duration is recorded even if the mid-beat rule rejects, so the declared vs
+    # actual comparison covers every candidate that resolved to timestamps.
+    out.duration_s = round(sum(r.end_s - r.start_s for r in resolved), 2)
     mid = _mid_beat_cut(resolved, episode)
     if mid:
         return reject(f"{R_MID_BEAT}: {mid}")
 
     out.segments_resolved = resolved
-    out.duration_s = round(sum(r.end_s - r.start_s for r in resolved), 2)
     if out.duration_s < MIN_S:
         return reject(f"{R_SHORT}: {out.duration_s:.1f}s")
     if out.duration_s > MAX_S:
@@ -169,19 +186,60 @@ def validate_candidate(cand: LLMCandidate, episode: Episode, candidate_id: str) 
 
 
 def _mid_beat_cut(resolved: list[ResolvedSegment], episode: Episode) -> str | None:
-    """Time-based check against ALL beats in the episode (not just the id range):
-    - any beat starting inside a segment must end by the segment end;
-    - an ACTION/DIALOGUE beat starting before a segment start must end by it."""
+    """Time-based check against ALL DIALOGUE beats in the episode (not just the
+    id range). A dialogue beat that overlaps a segment must not stick out past
+    the segment's end, or before its start, by more than MID_BEAT_TOL_S."""
+    tol = MID_BEAT_TOL_S + EPS
     for k, seg in enumerate(resolved, 1):
         for b in episode.beats:
-            if seg.start_s - EPS <= b.start_s < seg.end_s - EPS and b.end_s > seg.end_s + EPS:
+            if b.kind not in NO_SPLIT_KINDS:
+                continue
+            if seg.start_s - EPS <= b.start_s < seg.end_s - EPS and b.end_s > seg.end_s + tol:
                 return (f"{b.id} ({b.kind.value} {b.start_s:.2f}-{b.end_s:.2f}) runs past "
                         f"segment {k} end {seg.end_s:.2f}")
-            if (b.kind in NO_SPLIT_AT_START
-                    and b.start_s < seg.start_s - EPS and b.end_s > seg.start_s + EPS):
+            if b.start_s < seg.start_s - tol and b.end_s > seg.start_s + EPS:
                 return (f"{b.id} ({b.kind.value} {b.start_s:.2f}-{b.end_s:.2f}) is cut by "
                         f"segment {k} start {seg.start_s:.2f}")
     return None
+
+
+def candidate_score(c: Candidate) -> float:
+    wh, wc, ws = SCORE_W
+    return wh * (c.hook_score or 0) + wc * (c.cliff_score or 0) + ws * (c.standalone_score or 0)
+
+
+def _overlap_s(a: Candidate, b: Candidate) -> float:
+    return sum(
+        max(0.0, min(x.end_s, y.end_s) - max(x.start_s, y.start_s))
+        for x in a.segments_resolved for y in b.segments_resolved
+    )
+
+
+def _duplicates(a: Candidate, b: Candidate) -> bool:
+    """Same end beat, or time overlap > 50% of the shorter clip's duration."""
+    if a.segments_resolved[-1].end_id == b.segments_resolved[-1].end_id:
+        return True
+    shorter = min(a.duration_s or 0.0, b.duration_s or 0.0)
+    return shorter > 0 and _overlap_s(a, b) > DUP_OVERLAP_FRAC * shorter + EPS
+
+
+def dedupe_accepted(result: ExtractionResult) -> ExtractionResult:
+    """Within one episode, keep the higher-scoring of any duplicate pair; the
+    other moves to rejected with reason "duplicate_of:<kept id>". In place."""
+    order = sorted(range(len(result.accepted)),
+                   key=lambda i: (-candidate_score(result.accepted[i]), i))
+    kept: list[Candidate] = []
+    for i in order:
+        c = result.accepted[i]
+        dup_of = next((k for k in kept if _duplicates(c, k)), None)
+        if dup_of is None:
+            kept.append(c)
+        else:
+            c.reject_reason = f"{R_DUPLICATE}:{dup_of.candidate_id}"
+            result.rejected.append(c)
+    kept_ids = {c.candidate_id for c in kept}
+    result.accepted = [c for c in result.accepted if c.candidate_id in kept_ids]
+    return result
 
 
 def validate_response(raw: str, episode: Episode) -> ExtractionResult:
@@ -193,18 +251,39 @@ def validate_response(raw: str, episode: Episode) -> ExtractionResult:
             result.rejected.append(Candidate(candidate_id=cid, reject_reason=item))
             continue
         cand = validate_candidate(item, episode, cid)
+        if cand.declared_duration_s is not None and cand.duration_s is not None:
+            cand.duration_delta_s = round(cand.declared_duration_s - cand.duration_s, 2)
         (result.rejected if cand.reject_reason else result.accepted).append(cand)
     return result
 
 
-def extract_episode(episode: Episode, *, max_tokens: int = 8000) -> ExtractionResult:
-    """One LLM call for the episode, then code-side validation."""
+def extract_episode(episode: Episode, *, max_tokens: int | None = None) -> ExtractionResult:
+    """One LLM call for the episode, then code-side validation and dedupe.
+    max_tokens=None uses llm.DEFAULT_MAX_TOKENS."""
     system, user = load_prompt(), build_user_message(episode)
-    raw = llm.complete(system, user, json_mode=True, max_tokens=max_tokens)
-    result = validate_response(raw, episode)
+    kw = {} if max_tokens is None else {"max_tokens": max_tokens}
+    raw = llm.complete(system, user, json_mode=True, **kw)
+    result = dedupe_accepted(validate_response(raw, episode))
     result.model = llm.last_model  # actual responder (may be the fallback)
+    result.response_model = llm.last_response_model
     result.prompt_hash = llm._prompt_hash(system, user)
     return result
+
+
+def duration_rows(result: ExtractionResult) -> list[dict]:
+    """Declared (LLM) vs actual (code) duration per candidate. No script text."""
+    return [
+        {"episode": result.episode, "candidate_id": c.candidate_id,
+         "declared_s": c.declared_duration_s, "actual_s": c.duration_s,
+         "delta_s": c.duration_delta_s, "reject_reason": c.reject_reason}
+        for c in sorted(result.accepted + result.rejected, key=_cand_order)
+    ]
+
+
+def _cand_order(c: Candidate) -> tuple[int, str]:
+    """LLM order: 'e001-c3' -> 3. Unparseable ids sort last, by id."""
+    tail = c.candidate_id.rsplit("-c", 1)[-1]
+    return (int(tail), "") if tail.isdigit() else (10**9, c.candidate_id)
 
 
 def write_result(result: ExtractionResult, out_dir: str | Path | None = None) -> Path:

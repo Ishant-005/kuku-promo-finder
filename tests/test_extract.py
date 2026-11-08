@@ -153,13 +153,56 @@ def test_beat_table_format_and_trim():
     ep = _ep()
     ep.beats[1] = ep.beats[1].model_copy(update={"text": "a|b  " + "x" * 300})
     table = extract.build_beat_table(ep).splitlines()
-    assert table[0] == "id | kind | speaker | start | end | text"
+    assert table[0] == "id | kind | speaker | start | end | cum_start | cum_end | text"
     assert len(table) == 1 + len(ep.beats)
-    assert table[1] == "e007-b001 | CAMERA | - | 0.00 | 5.00 | line 1"
+    assert table[1] == "e007-b001 | CAMERA | - | 0.0 | 5.0 | 0.0 | 5.0 | line 1"
     row = table[2].split(" | ")
-    assert row[:5] == ["e007-b002", "DIALOGUE", "ANNA", "5.00", "10.00"]
-    assert len(row[5]) == extract.TEXT_MAX and row[5].endswith("…")
-    assert row[5].startswith("a/b x")
+    assert row[:7] == ["e007-b002", "DIALOGUE", "ANNA", "5.0", "10.0", "5.0", "10.0"]
+    assert len(row[7]) == extract.TEXT_MAX and row[7].endswith("…")
+    assert row[7].startswith("a/b x")
+
+
+def test_beat_table_cum_is_relative_to_first_beat_one_decimal():
+    ep = _ep()
+    ep.beats = [b.model_copy(update={"start_s": b.start_s + 38.14, "end_s": b.end_s + 38.14})
+                for b in ep.beats]
+    rows = [r.split(" | ") for r in extract.build_beat_table(ep).splitlines()[1:]]
+    assert rows[0][3:7] == ["38.1", "43.1", "0.0", "5.0"]
+    assert rows[11][3:7] == ["93.1", "98.1", "55.0", "60.0"]
+    # span b002..b007 = cum_end(b007) - cum_start(b002) = 35 - 5 = 30 = validator's duration
+    assert float(rows[6][6]) - float(rows[1][5]) == 30.0
+
+
+def test_declared_duration_delta_and_rows():
+    raw = json.dumps({"candidates": [
+        _cand([(2, 7)], declared_duration_s=28.5),   # actual 30 -> delta -1.5
+        _cand([(2, 4)], declared_duration_s=21),     # actual 15 -> too_short, delta +6
+        _cand([(2, 9)]),                             # no declared -> delta None
+        _cand([(2, 99)], declared_duration_s=30),    # unknown id -> actual None
+    ]})
+    res = extract.validate_response(raw, _ep())
+    c = _by_id(res)
+    assert c["e007-c1"].declared_duration_s == 28.5 and c["e007-c1"].duration_delta_s == -1.5
+    assert c["e007-c2"].reject_reason.startswith(extract.R_SHORT)
+    assert c["e007-c2"].duration_delta_s == 6.0
+    assert c["e007-c3"].declared_duration_s is None and c["e007-c3"].duration_delta_s is None
+    assert c["e007-c4"].duration_s is None and c["e007-c4"].duration_delta_s is None
+    rows = extract.duration_rows(res)
+    assert [r["candidate_id"] for r in rows] == ["e007-c1", "e007-c2", "e007-c3", "e007-c4"]
+    assert rows[1] == {"episode": 7, "candidate_id": "e007-c2", "declared_s": 21.0,
+                       "actual_s": 15.0, "delta_s": 6.0,
+                       "reject_reason": c["e007-c2"].reject_reason}
+
+
+def test_mid_beat_reject_still_records_actual_duration():
+    ep = _ep()
+    ep.beats[7] = ep.beats[7].model_copy(  # DIALOGUE b008 starts before b007 ends
+        update={"start_s": 33.0, "kind": BeatKind.DIALOGUE})
+    res = extract.validate_response(
+        json.dumps({"candidates": [_cand([(2, 7)], declared_duration_s=33)]}), ep)
+    (c,) = res.rejected
+    assert c.reject_reason.startswith(extract.R_MID_BEAT)
+    assert c.duration_s == 30.0 and c.duration_delta_s == 3.0 and not c.segments_resolved
 
 
 def test_extract_episode_uses_prompt_file_and_writes(monkeypatch, tmp_path):
@@ -168,6 +211,7 @@ def test_extract_episode_uses_prompt_file_and_writes(monkeypatch, tmp_path):
     def fake_complete(system, user, **kw):
         seen.update(system=system, user=user, kw=kw)
         extract.llm.last_model = "fake-fallback"
+        extract.llm.last_response_model = "fake-fallback-2025"
         return "```json\n" + json.dumps(FAKE) + "\n```"
 
     monkeypatch.setattr(extract.llm, "complete", fake_complete)
@@ -176,12 +220,16 @@ def test_extract_episode_uses_prompt_file_and_writes(monkeypatch, tmp_path):
     assert seen["system"] == extract.load_prompt()
     assert "LOGLINE: A test." in seen["user"] and "e007-b012 |" in seen["user"]
     assert seen["kw"]["json_mode"] is True
+    assert res.response_model == "fake-fallback-2025"
     assert res.model == "fake-fallback" and len(res.prompt_hash) == 12
 
     path = extract.write_result(res, tmp_path)
     assert path == tmp_path / "episodes" / "ep007.json"
     data = json.loads(path.read_text())
-    assert data["episode"] == 7 and len(data["accepted"]) == 7
+    # FAKE's 7 valid candidates all overlap c1 (or share its end beat): dedupe keeps c1.
+    assert data["episode"] == 7 and [c["candidate_id"] for c in data["accepted"]] == ["e007-c1"]
+    dups = [c for c in data["rejected"] if c["reject_reason"].startswith("duplicate_of:")]
+    assert len(dups) == 6 and all(c["reject_reason"] == "duplicate_of:e007-c1" for c in dups)
     assert {"accepted", "rejected", "episode_note", "model"} <= data.keys()
 
 
@@ -215,12 +263,12 @@ def test_mid_beat_dialogue_after_end_id_starts_before_cut():
     assert "e007-b008" in c.reject_reason and "end" in c.reject_reason
 
 
-def test_mid_beat_any_kind_starting_inside_counts():
+@pytest.mark.parametrize("kind", [BeatKind.CAMERA, BeatKind.ACTION, BeatKind.OTHER])
+def test_non_dialogue_running_past_end_is_allowed(kind):
     ep = _ep()
-    _shift(ep, 10, start_s=44.0, end_s=52.0)    # CAMERA starts inside 5-45, ends after
+    _shift(ep, 10, kind=kind, start_s=44.0, end_s=52.0)   # starts inside 5-45, ends after
     c = _one(ep, [(2, 9)])
-    assert c.reject_reason.startswith(extract.R_MID_BEAT)
-    assert "e007-b010" in c.reject_reason
+    assert c.reject_reason is None, c.reject_reason
 
 
 def test_mid_beat_dialogue_spanning_segment_start():
@@ -233,19 +281,90 @@ def test_mid_beat_dialogue_spanning_segment_start():
 
 def test_mid_beat_second_segment_start_checked():
     ep = _ep()
-    _shift(ep, 6, kind=BeatKind.ACTION, start_s=25.0, end_s=37.0)  # spans b007 start (30)
+    _shift(ep, 6, start_s=25.0, end_s=37.0)      # DIALOGUE spans b007 start (30)
     c = _one(ep, [(2, 4), (7, 11)])
     assert c.reject_reason.startswith(extract.R_MID_BEAT)
     assert "segment 2 start" in c.reject_reason
 
 
-def test_camera_spanning_segment_start_is_allowed():
+@pytest.mark.parametrize("kind", [BeatKind.CAMERA, BeatKind.ACTION, BeatKind.OTHER])
+def test_non_dialogue_spanning_segment_start_is_allowed(kind):
     ep = _ep()
-    _shift(ep, 1, end_s=12.0)                    # CAMERA 0-12 runs over the 5.0 start
+    _shift(ep, 1, kind=kind, end_s=12.0)         # 0-12 runs over the 5.0 start
     c = _one(ep, [(2, 7)])
     assert c.reject_reason is None, c.reject_reason
+
+
+@pytest.mark.parametrize("overrun,ok", [(0.3, True), (0.29, True), (0.31, False)])
+def test_dialogue_end_tolerance(overrun, ok):
+    ep = _ep()
+    _shift(ep, 8, kind=BeatKind.DIALOGUE, start_s=34.0, end_s=35.0 + overrun)  # vs end 35.0
+    c = _one(ep, [(2, 7)])
+    assert (c.reject_reason is None) is ok, c.reject_reason
+
+
+@pytest.mark.parametrize("early,ok", [(0.3, True), (0.31, False)])
+def test_dialogue_start_tolerance(early, ok):
+    ep = _ep()
+    _shift(ep, 2, start_s=10.0 - early, end_s=11.0)     # DIALOGUE b002 spans start 10.0
+    c = _one(ep, [(3, 8)])                               # segment starts on b003 (10.0)
+    assert (c.reject_reason is None) is ok, c.reject_reason
 
 
 def test_back_to_back_beats_are_not_mid_beat():
     c = _one(_ep(), [(2, 7)])                    # b008 starts exactly at 35.0
     assert c.reject_reason is None
+
+
+# --- dedupe -------------------------------------------------------------------
+
+def _dedupe(cands):
+    res = extract.validate_response(json.dumps({"candidates": cands}), _ep())
+    assert not res.rejected  # all valid before dedupe
+    return extract.dedupe_accepted(res)
+
+
+def _reasons(res):
+    return {c.candidate_id: c.reject_reason for c in res.rejected}
+
+
+def test_dedupe_shared_end_beat_keeps_higher_score():
+    # c1 0-15 + 35-40 (20s), c2 15-40 (25s): overlap only 5s, but both end on b008.
+    res = _dedupe([_cand([(1, 3), (8, 8)], hook_score=3), _cand([(4, 8)], hook_score=5)])
+    assert [c.candidate_id for c in res.accepted] == ["e007-c2"]
+    assert _reasons(res) == {"e007-c1": "duplicate_of:e007-c2"}
+
+
+def test_dedupe_overlap_over_half_of_shorter():
+    # c1 5-35 (30s), c2 15-45 (30s): overlap 20s > 15s -> dup; tie keeps LLM order.
+    res = _dedupe([_cand([(2, 7)]), _cand([(4, 9)])])
+    assert [c.candidate_id for c in res.accepted] == ["e007-c1"]
+    assert _reasons(res) == {"e007-c2": "duplicate_of:e007-c1"}
+
+
+def test_dedupe_overlap_exactly_half_is_kept():
+    # c1 0-20 (20s), c2 10-40 (30s): overlap 10s == 50% of 20s -> not a dup.
+    res = _dedupe([_cand([(1, 4)]), _cand([(3, 8)])])
+    assert len(res.accepted) == 2 and not res.rejected
+
+
+def test_dedupe_counts_multi_segment_overlap():
+    # c1 5-15 + 30-45 (25s); c2 10-40 (30s): overlap 5 + 10 = 15s > 12.5s.
+    res = _dedupe([_cand([(2, 3), (7, 9)], cliff_score=5), _cand([(3, 8)])])
+    assert [c.candidate_id for c in res.accepted] == ["e007-c1"]
+    assert _reasons(res) == {"e007-c2": "duplicate_of:e007-c1"}
+
+
+def test_dedupe_disjoint_kept_and_order_preserved():
+    # c1 0-20, c2 35-60, c3 25-45 (overlaps c2 by 10s == 50% of 20s) -> all kept.
+    res = _dedupe([_cand([(1, 4)]), _cand([(8, 12)]), _cand([(6, 9)], hook_score=5)])
+    assert [c.candidate_id for c in res.accepted] == ["e007-c1", "e007-c2", "e007-c3"]
+
+
+def test_dedupe_compares_against_kept_only():
+    # best c3 (5-35) knocks out c1 (5-30); c2 (35-60) is disjoint from c3 -> kept,
+    # even though c1 is gone.
+    res = _dedupe([_cand([(2, 6)], hook_score=3), _cand([(8, 12)], hook_score=3),
+                   _cand([(2, 7)], hook_score=5)])
+    assert [c.candidate_id for c in res.accepted] == ["e007-c2", "e007-c3"]
+    assert _reasons(res) == {"e007-c1": "duplicate_of:e007-c3"}

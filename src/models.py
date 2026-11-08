@@ -66,6 +66,7 @@ class LLMCandidate(BaseModel):
     standalone_reason: str = ""
     why_it_works: str = ""
     hook_type: HookType = "other"
+    declared_duration_s: float | None = None  # LLM's own arithmetic; logged, never trusted
 
     @field_validator("hook_type", mode="before")
     @classmethod
@@ -94,6 +95,8 @@ class Candidate(BaseModel):
     hook_type: str = "other"
     segments_resolved: list[ResolvedSegment] = []
     duration_s: float | None = None
+    declared_duration_s: float | None = None
+    duration_delta_s: float | None = None  # declared - actual (None if either missing)
     reject_reason: str | None = None       # None = accepted
 
 
@@ -104,4 +107,5 @@ class ExtractionResult(BaseModel):
     rejected: list[Candidate] = []
     episode_note: str = ""
     model: str | None = None
+    response_model: str | None = None  # server-reported model name
     prompt_hash: str | None = None

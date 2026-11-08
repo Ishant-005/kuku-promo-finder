@@ -76,7 +76,7 @@ def _fake_response(code: int):
     return SimpleNamespace(status_code=code, headers={}, request=_REQ)
 
 
-def _status_err(code: int) -> Exception:
+def _status_err(code: int, body=None, msg: str | None = None) -> Exception:
     cls = {
         400: llm.openai.BadRequestError,
         404: llm.openai.NotFoundError,
@@ -85,7 +85,7 @@ def _status_err(code: int) -> Exception:
         503: llm.openai.InternalServerError,
         401: llm.openai.AuthenticationError,
     }[code]
-    return cls(f"err {code}", response=_fake_response(code), body=None)
+    return cls(msg or f"err {code}", response=_fake_response(code), body=body)
 
 
 def _timeout_err() -> Exception:
@@ -98,10 +98,14 @@ class _Usage:
 
 
 class _Resp:
-    def __init__(self, text):
+    def __init__(self, text, model=None):
         msg = type("M", (), {"content": text})()
         self.choices = [type("C", (), {"message": msg})()]
         self.usage = _Usage()
+        self.model = model
+
+
+KWARGS: list[dict] = []  # every create(**kw) seen by the fake client, per test
 
 
 @pytest.fixture
@@ -125,6 +129,9 @@ def live(tmp_path, monkeypatch):
     script: dict[str, list] = {}
     calls: list[tuple[str, str]] = []  # (base_url, model)
     sleeps: list[float] = []
+    KWARGS.clear()
+    kwargs_seen = KWARGS
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
 
     class FakeOpenAI:
         def __init__(self, *, base_url, api_key, timeout, max_retries):
@@ -135,10 +142,11 @@ def live(tmp_path, monkeypatch):
             class _Completions:
                 def create(self, **kw):
                     calls.append((outer.base_url, kw["model"]))
+                    kwargs_seen.append(kw)
                     outcome = script[kw["model"]].pop(0)
                     if isinstance(outcome, Exception):
                         raise outcome
-                    return _Resp(outcome)
+                    return _Resp(outcome, model=f"{kw['model']}-served")
 
             self.chat = type("Chat", (), {"completions": _Completions()})()
 
@@ -163,6 +171,7 @@ def test_primary_success_no_fallback(live):
     assert rec["usage"] == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
     assert rec["prompt_hash"] == llm._prompt_hash("s", "u")
     assert rec["response"] == "hi"
+    assert rec["response_model"] == "prim-served" and llm.last_response_model == "prim-served"
     assert {"ts", "model", "prompt_hash", "usage", "response", "fallback_used"} <= rec.keys()
 
 
@@ -180,6 +189,8 @@ def test_model_error_falls_back_immediately(live, code):
         ("prim", False), ("fb-model", True)]
     assert "error" in recs[0] and recs[0]["usage"] is None
     assert recs[1]["response"] == "from fallback"
+    assert recs[1]["model"] == "fb-model" and recs[1]["response_model"] == "fb-model-served"
+    assert "response_model" not in recs[0]  # error records have no response
 
 
 @pytest.mark.parametrize("make_err", [
@@ -245,3 +256,90 @@ def test_fallback_url_and_key_default_to_primary(live, monkeypatch):
     script["fb-model"] = ["ok"]
     assert llm.complete("s", "u") == "ok"
     assert calls[-1] == ("http://primary", "fb-model")
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort, max_tokens default, error-body logging
+# ---------------------------------------------------------------------------
+
+def _reasoning_400():
+    body = {"error": {"message": "Unrecognized request argument supplied: reasoning_effort",
+                      "type": "invalid_request_error"}}
+    return _status_err(400, body=body, msg="Error code: 400")
+
+
+def test_reasoning_effort_default_low_and_max_tokens_3000(live):
+    script, calls, sleeps, log = live
+    script["prim"] = ["ok"]
+    llm.complete("s", "u")
+    (kw,) = KWARGS
+    assert kw["extra_body"] == {"reasoning_effort": "low"}
+    assert kw["max_tokens"] == 3000
+    assert _log(log)[0]["reasoning_effort"] == "low"
+
+
+def test_reasoning_effort_from_env_and_off(live, monkeypatch):
+    script, calls, sleeps, log = live
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
+    script["prim"] = ["a", "b"]
+    llm.complete("s", "u")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "off")
+    llm.complete("s", "u")
+    assert KWARGS[0]["extra_body"] == {"reasoning_effort": "high"}
+    assert "extra_body" not in KWARGS[1]
+
+
+def test_reasoning_400_retries_once_without_param_same_endpoint(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_reasoning_400(), "ok without"]
+    script["fb-model"] = ["should not be used"]
+    assert llm.complete("s", "u") == "ok without"
+    assert calls == [("http://primary", "prim")] * 2  # no fallback
+    assert sleeps == []
+    assert "extra_body" in KWARGS[0]
+    assert "extra_body" not in KWARGS[1]
+    recs = _log(log)
+    assert recs[0]["reasoning_effort_dropped"] is True
+    assert "reasoning_effort" in recs[0]["error"]  # body text is logged
+    assert recs[1]["reasoning_effort"] is None and recs[1]["response"] == "ok without"
+
+
+def test_reasoning_400_only_dropped_once_then_falls_back(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_reasoning_400(), _reasoning_400()]
+    script["fb-model"] = ["fb ok"]
+    assert llm.complete("s", "u") == "fb ok"
+    assert calls == [("http://primary", "prim")] * 2 + [("http://fb", "fb-model")]
+    recs = _log(log)
+    assert [r.get("reasoning_effort_dropped", False) for r in recs] == [True, False, False]
+    # fallback endpoint starts fresh, with the param again
+    assert KWARGS[2]["extra_body"] == {"reasoning_effort": "low"}
+
+
+def test_unrelated_400_does_not_drop_param(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_status_err(400, body={"error": {"message": "bad model"}})]
+    script["fb-model"] = ["fb ok"]
+    assert llm.complete("s", "u") == "fb ok"
+    assert calls == [("http://primary", "prim"), ("http://fb", "fb-model")]
+    assert "reasoning_effort_dropped" not in _log(log)[0]
+
+
+def test_error_log_includes_truncated_body(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_status_err(401, body={"error": {"message": "x" * 1000}})]
+    with pytest.raises(llm.openai.AuthenticationError):
+        llm.complete("s", "u")
+    err = _log(log)[0]["error"]
+    assert err.startswith("AuthenticationError: 401 {")
+    assert '"message": "xxx' in err
+    body_part = err[len("AuthenticationError: 401 "):]
+    assert len(body_part) == llm.ERROR_BODY_MAX
+
+
+def test_error_log_falls_back_to_str_when_no_body(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_status_err(401, msg="plain message")]
+    with pytest.raises(llm.openai.AuthenticationError):
+        llm.complete("s", "u")
+    assert "plain message" in _log(log)[0]["error"]

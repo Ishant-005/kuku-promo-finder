@@ -7,7 +7,12 @@
 - Fallback is tried immediately on 400/404 from the primary, or after the
   primary's retries are exhausted on 429/5xx/timeout. The fallback gets the
   same retry policy; there is no second fallback.
-- Every real call attempt is appended to outputs/logs/calls.jsonl.
+- Every real call attempt is appended to outputs/logs/calls.jsonl. Success
+  records carry both the requested "model" and the server's "response_model".
+- LLM_REASONING_EFFORT (default "low"; "off" disables): sent as
+  extra_body={"reasoning_effort": ...}. If an endpoint answers 400 and the
+  error mentions the parameter, that endpoint is retried once without it
+  (logged as reasoning_effort_dropped) and stays without it for this call.
 - DRY_RUN=1: no network; prompt is written to outputs/logs/dry/ instead.
 """
 from __future__ import annotations
@@ -26,6 +31,9 @@ from . import config
 TIMEOUT_S = 60
 MAX_ATTEMPTS = 5
 BACKOFF_S = (2, 4, 8, 16, 32)  # BACKOFF_S[i] = sleep after failed attempt i+1
+DEFAULT_MAX_TOKENS = 3000
+ERROR_BODY_MAX = 300
+REASONING_PARAM = "reasoning_effort"
 
 LOG_DIR: Path = config.ROOT / "outputs" / "logs"
 
@@ -42,6 +50,9 @@ _clients: dict[tuple[str, str], openai.OpenAI] = {}
 # Model that produced the most recent successful response (primary or fallback).
 # None after a DRY_RUN call. Single-threaded use only.
 last_model: str | None = None
+# Model name the server reported in that response (resp.model); may differ from
+# the requested one (aliases, routing). None after DRY_RUN or if not reported.
+last_response_model: str | None = None
 
 
 def _get_client(ep: _Endpoint) -> openai.OpenAI:
@@ -101,6 +112,34 @@ def _is_retryable(exc: Exception) -> bool:
     return s is not None and (s == 429 or 500 <= s < 600)
 
 
+def _error_body(exc: Exception) -> str:
+    """Provider error body (or str(exc)), truncated to ERROR_BODY_MAX chars."""
+    body = getattr(exc, "body", None)
+    if body is None:
+        text = str(exc)
+    elif isinstance(body, str):
+        text = body
+    else:
+        try:
+            text = json.dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(body)
+    return text[:ERROR_BODY_MAX]
+
+
+def _rejects_reasoning_param(exc: Exception) -> bool:
+    """400 whose message/body mentions the reasoning parameter."""
+    if _status(exc) != 400:
+        return False
+    text = f"{exc} {getattr(exc, 'body', '') or ''}".lower()
+    return REASONING_PARAM in text
+
+
+def _reasoning_effort() -> str | None:
+    val = config.get("LLM_REASONING_EFFORT", "low")
+    return None if val.lower() == "off" else val
+
+
 def _is_model_error(exc: Exception) -> bool:
     return _status(exc) in (400, 404)
 
@@ -136,51 +175,72 @@ def _dry_run(system: str, user: str, json_mode: bool, max_tokens: int, phash: st
 
 
 def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_used: bool) -> str:
-    """Try one endpoint up to MAX_ATTEMPTS times. Raises the last exception."""
+    """Try one endpoint up to MAX_ATTEMPTS times. Raises the last exception.
+
+    A 400 that mentions reasoning_effort triggers one immediate extra attempt
+    without extra_body (not counted against MAX_ATTEMPTS)."""
     client = _get_client(ep)
     kwargs = {**base_kwargs, "model": ep.model}
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    attempt = 0
+    while attempt < MAX_ATTEMPTS:
+        attempt += 1
+        effort = (kwargs.get("extra_body") or {}).get(REASONING_PARAM)
         t0 = time.monotonic()
         try:
             resp = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - logged, then retried or re-raised
-            _append_log({
+            dropping = effort is not None and _rejects_reasoning_param(exc)
+            rec = {
                 "ts": _now(),
                 "model": ep.model,
                 "prompt_hash": phash,
                 "fallback_used": fallback_used,
                 "attempt": attempt,
+                "reasoning_effort": effort,
                 "latency_ms": round((time.monotonic() - t0) * 1000),
                 "usage": None,
-                "error": f"{type(exc).__name__}: {_status(exc) or ''} {exc}"[:2000],
-            })
+                "error": f"{type(exc).__name__}: {_status(exc) or ''} {_error_body(exc)}",
+            }
+            if dropping:
+                rec["reasoning_effort_dropped"] = True
+            _append_log(rec)
+            if dropping:
+                kwargs.pop("extra_body", None)
+                attempt -= 1  # the retry without the param is a free extra attempt
+                continue
             if attempt < MAX_ATTEMPTS and _is_retryable(exc):
                 time.sleep(BACKOFF_S[attempt - 1])
                 continue
             raise
 
         text = (resp.choices[0].message.content or "") if resp.choices else ""
+        served = getattr(resp, "model", None)
         _append_log({
             "ts": _now(),
             "model": ep.model,
+            "response_model": served,
             "prompt_hash": phash,
             "fallback_used": fallback_used,
             "attempt": attempt,
+            "reasoning_effort": effort,
             "latency_ms": round((time.monotonic() - t0) * 1000),
             "usage": _usage_dict(resp.usage),
             "response": text,
         })
-        global last_model
+        global last_model, last_response_model
         last_model = ep.model
+        last_response_model = served
         return text
 
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
-def complete(system: str, user: str, *, json_mode: bool = True, max_tokens: int = 4000) -> str:
+def complete(system: str, user: str, *, json_mode: bool = True,
+             max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
     """Send one chat completion; return the raw response text."""
-    global last_model
+    global last_model, last_response_model
     last_model = None
+    last_response_model = None
     phash = _prompt_hash(system, user)
     if config.dry_run():
         return _dry_run(system, user, json_mode, max_tokens, phash)
@@ -194,6 +254,9 @@ def complete(system: str, user: str, *, json_mode: bool = True, max_tokens: int 
     }
     if json_mode:
         base_kwargs["response_format"] = {"type": "json_object"}
+    effort = _reasoning_effort()
+    if effort:
+        base_kwargs["extra_body"] = {REASONING_PARAM: effort}
 
     try:
         return _call_with_retries(_primary(), base_kwargs, phash, fallback_used=False)

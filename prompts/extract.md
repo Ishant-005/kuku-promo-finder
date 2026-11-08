@@ -28,7 +28,9 @@ promo:
    Prefer clips where names and relationships are spoken aloud.
 
 You will receive one episode as a logline plus a numbered beat table. Each beat
-has an id, kind (CAMERA / ACTION / DIALOGUE), speaker, start, end, and text.
+has an id, kind (CAMERA / ACTION / DIALOGUE), speaker, start, end, cum_start,
+cum_end, and text. All times are seconds. cum_start / cum_end are seconds
+elapsed since the first beat of the episode.
 
 Propose up to 5 promo candidates. Rules:
 - Reference beats ONLY by id. Never write timestamps.
@@ -37,20 +39,36 @@ Propose up to 5 promo candidates. Rules:
   episode order. Prefer one continuous segment; use 2–3 only when the skip clearly
   tightens the clip.
 - Total duration 20–60 s. Aim for 25–45 s.
+- Compute duration from the table, never estimate it. For one segment:
+  duration = cum_end of its last beat − cum_start of its first beat. For several
+  segments, add up each segment's duration. Report the total as
+  "declared_duration_s".
+- Anything under 20 s is discarded by the validator. If a clip comes out short,
+  do not drop it: extend the END forward to the next unresolved line (a question,
+  threat, or moment before a consequence) until it reaches 20 s, then recompute.
+  Worked example: beats b12 (start 30.0) to b19 (end 44.5) = 14.5 s — too short;
+  extend to b23 (end 52.0) = 22.0 s.
 - Segment boundaries must be beat boundaries. Never cut inside a line of dialogue.
 - The first beat of the first segment must not be a SOUND FX beat (kind OTHER).
   CAMERA, ACTION and DIALOGUE are all allowed, subject to the event rule above.
-- Beats overlap in time. Do not end a segment while the next line has already
-  started, and do not start a segment in the middle of an ACTION or DIALOGUE
-  beat that began earlier. Check the start/end columns, not just the ids.
+- Beats overlap in time. Never cut a line of DIALOGUE: do not end a segment
+  while a dialogue line has already started, and do not start a segment in the
+  middle of a dialogue line that began earlier. CAMERA, ACTION and SOUND FX
+  beats may run across a boundary. Check the start/end columns, not just the ids.
+- No near-duplicates: two candidates must not end on the same beat, and must
+  not overlap by more than half of the shorter one's duration. If two ideas
+  collide, keep only the stronger one. Duplicates are discarded automatically.
 - Be honest: if the episode has fewer than 5 strong promos, return fewer. Zero is
   acceptable.
+
+Return the JSON directly without extended reasoning.
 
 Return strict JSON:
 {
   "candidates": [
     {
       "segments": [{"start_id": "...", "end_id": "..."}],
+      "declared_duration_s": <number, computed from the table>,
       "hook": "<the exact line or action in the first beat, <=15 words>",
       "cliffhanger": "<what is unresolved at the cut, one sentence>",
       "hook_score": 1-5,
