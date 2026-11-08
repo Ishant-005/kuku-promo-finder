@@ -37,6 +37,12 @@ def test_dry_run_writes_prompt_file(dry):
     assert files[0].name.endswith(f"_{rec['prompt_hash']}.json")
 
 
+def test_dry_run_clears_last_model(dry, monkeypatch):
+    monkeypatch.setattr(llm, "last_model", "stale")
+    llm.complete("sys", "hello")
+    assert llm.last_model is None
+
+
 def test_dry_run_does_not_log_calls(dry):
     llm.complete("sys", "hello")
     assert not (dry / "calls.jsonl").exists()
@@ -149,6 +155,7 @@ def test_primary_success_no_fallback(live):
     script, calls, sleeps, log = live
     script["prim"] = ["hi"]
     assert llm.complete("s", "u") == "hi"
+    assert llm.last_model == "prim"
     assert calls == [("http://primary", "prim")]
     assert sleeps == []
     (rec,) = _log(log)
@@ -166,6 +173,7 @@ def test_model_error_falls_back_immediately(live, code):
     script["fb-model"] = ["from fallback"]
     assert llm.complete("s", "u") == "from fallback"
     assert calls == [("http://primary", "prim"), ("http://fb", "fb-model")]
+    assert llm.last_model == "fb-model"
     assert sleeps == []  # no retry before falling back
     recs = _log(log)
     assert [(r["model"], r["fallback_used"]) for r in recs] == [

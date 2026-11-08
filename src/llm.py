@@ -39,6 +39,10 @@ class _Endpoint:
 
 _clients: dict[tuple[str, str], openai.OpenAI] = {}
 
+# Model that produced the most recent successful response (primary or fallback).
+# None after a DRY_RUN call. Single-threaded use only.
+last_model: str | None = None
+
 
 def _get_client(ep: _Endpoint) -> openai.OpenAI:
     key = (ep.base_url, ep.api_key)
@@ -166,6 +170,8 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
             "usage": _usage_dict(resp.usage),
             "response": text,
         })
+        global last_model
+        last_model = ep.model
         return text
 
     raise RuntimeError("unreachable")  # pragma: no cover
@@ -173,6 +179,8 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
 
 def complete(system: str, user: str, *, json_mode: bool = True, max_tokens: int = 4000) -> str:
     """Send one chat completion; return the raw response text."""
+    global last_model
+    last_model = None
     phash = _prompt_hash(system, user)
     if config.dry_run():
         return _dry_run(system, user, json_mode, max_tokens, phash)
