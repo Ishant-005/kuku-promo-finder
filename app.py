@@ -99,8 +99,11 @@ with st.sidebar:
     fallback = st.text_input("Fallback model (optional, same endpoint)", "",
                              help="Leave empty unless the endpoint above serves a second model you want tried when the first fails.")
     with st.expander("Advanced"):
-        effort = st.selectbox("Reasoning effort (reasoning models only)", ["low", "medium", "high", "off"],
-                              index=["low", "medium", "high", "off"].index(_secret("LLM_REASONING_EFFORT", "low")))
+        effort_choice = st.selectbox(
+            "Reasoning effort", ["auto", "low", "medium", "high", "off"], index=0,
+            help="auto: send 'low' only when the model name looks like a reasoning model "
+                 "(gpt-oss, o1/o3/o4, deepseek-r1, qwen3, gemini 2.5+/3.x); otherwise send nothing. "
+                 "'off' never sends it. If a provider rejects the parameter, the wrapper retries once without it.")
         max_tokens = st.text_input("Max completion tokens", _secret("LLM_MAX_TOKENS", "3000"))
         sleep_s = st.number_input("Seconds between episodes (free-tier rate limits)", 0.0, 120.0, 20.0, 1.0)
         audit_sleep = st.number_input("Seconds between audit calls", 0.0, 60.0, 5.0, 1.0)
@@ -108,6 +111,27 @@ with st.sidebar:
     st.caption("Presets: Groq `https://api.groq.com/openai/v1` · Gemini "
                "`https://generativelanguage.googleapis.com/v1beta/openai/` · OpenAI `https://api.openai.com/v1`")
 
+
+REASONING_PATTERNS = ("gpt-oss", "o1", "o3", "o4", "deepseek-r1", "r1-", "qwen3", "thinking",
+                      "gemini-2.5", "gemini-3", "grok-3-mini", "grok-4", "sonar-reasoning")
+
+
+def _is_reasoning_model(name: str) -> bool:
+    n = (name or "").lower()
+    return any(tok in n for tok in REASONING_PATTERNS)
+
+
+def _resolve_effort(choice: str, model_name: str) -> str:
+    if choice != "auto":
+        return choice
+    return "low" if _is_reasoning_model(model_name) else "off"
+
+
+effort = _resolve_effort(effort_choice, model)
+with st.sidebar:
+    if effort_choice == "auto":
+        st.caption(f"Reasoning effort auto → **{effort}** for `{model or '…'}`"
+                   + ("" if effort == "low" else " (treated as a non-reasoning model; nothing sent)"))
 _apply_env({
     "LLM_BASE_URL": base_url, "LLM_API_KEY": api_key, "LLM_MODEL": model,
     "LLM_FALLBACK_MODEL": fallback, "LLM_FALLBACK_BASE_URL": "", "LLM_FALLBACK_API_KEY": "",
@@ -220,6 +244,20 @@ with tab_run:
                                  "standalone_score", "score"] if c in df.columns]
         st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
 
+        with st.expander("How the score is calculated"):
+            st.markdown(
+                """
+`score = 0.40 × hook + 0.35 × cliffhanger + 0.25 × standalone + duration bonus − same-episode penalty`
+
+- **hook / cliffhanger / standalone** — 1–5 ratings from the extraction model (one LLM call per episode).
+- **duration bonus** — +0.3 if the clip is 25–45 s (the sweet spot for Reels/Shorts), else 0.
+- **same-episode penalty** — 0 for the best clip from an episode, −0.5 for the second, −1.0 for the third, −2.0 beyond. Keeps the list from being ten clips of episode 1.
+
+Example: 5/5/5, 30 s, best in its episode → 5.0 + 0.3 = **5.3**. 4/5/5, 22 s, second in its episode → 4.6 − 0.5 = **4.1**.
+
+The score picks the top 30 candidates. The **final posting order** is a separate LLM re-rank of those 30 (`rank_reason` column); the score is kept alongside for transparency. Note the model's ratings cluster at 4–5, so the score separates clips mostly by duration and episode spread, not fine quality.
+                """
+            )
         m1, m2, m3, m4 = st.columns(4)
         pj = json.loads((out / "promos.json").read_text(encoding="utf-8"))
         m1.metric("Candidates accepted", pj.get("loaded", len(df)))
@@ -278,7 +316,17 @@ with tab_manual:
 
 **What you need**
 - The screenplays: one `.txt` per episode in the Kuku format (scene headings, timestamped CAMERA / ACTION / dialogue blocks). A `.zip` of them also works.
-- An API key for any OpenAI-compatible LLM endpoint. Free options: Groq (`https://api.groq.com/openai/v1`), Gemini (`https://generativelanguage.googleapis.com/v1beta/openai/`), Cerebras, Mistral. If the sidebar is already filled in, a key has been provided for you.
+- An API key for any OpenAI-compatible LLM endpoint. If the sidebar is already filled in, a key has been provided for you. Free options:
+
+| provider | base URL | reasoning model | non-reasoning model |
+|---|---|---|---|
+| Groq | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | `llama-3.3-70b-versatile` (if listed for your key) |
+| Cerebras | `https://api.cerebras.ai/v1` | `gpt-oss-120b` | `llama-3.3-70b` |
+| Mistral | `https://api.mistral.ai/v1` | — | `mistral-small-latest` |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-*-flash` (20 req/day free) | — |
+| OpenRouter | `https://openrouter.ai/api/v1` | varies | models ending in `:free` |
+
+  Model ids change; copy the exact id from the provider's model list. A wrong id shows as `404` in the run log.
 
 **Step by step**
 1. **Sidebar → Model endpoint.** Paste the Base URL, API key and the exact model id the provider lists (e.g. `openai/gpt-oss-120b` on Groq). A wrong model id gives a `404` in the run log. Leave *Fallback model* empty unless you know a second model on the *same* endpoint.
@@ -290,7 +338,7 @@ with tab_manual:
 7. **Check the rejections.** The *Rejected candidates* expander shows every proposal the validator threw out and why (unknown beat id, too short/long, cut inside a line, duplicate). This is where to look if an episode returned nothing.
 
 **Advanced (sidebar → Advanced)**
-- *Reasoning effort* — `low` for reasoning models (gpt-oss, Gemini thinking); `off` for plain chat models that reject the parameter.
+- *Reasoning effort* — `auto` (default) sends `low` only when the model name looks like a reasoning model (gpt-oss, o-series, DeepSeek-R1, Qwen3, Gemini 2.5+/3.x) and sends nothing otherwise. Force `low`/`off` if auto guesses wrong; a rejected parameter is retried without it automatically.
 - *Max completion tokens* — 3000 is enough; lower it to 2000 if the provider returns `413` (request too large for a free-tier minute).
 - *Seconds between episodes* — raise it if you see `429` rate-limit errors; 20–30 s suits Groq's free tier.
 
