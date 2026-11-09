@@ -13,6 +13,11 @@
   extra_body={"reasoning_effort": ...}. If an endpoint answers 400 and the
   error mentions the parameter, that endpoint is retried once without it
   (logged as reasoning_effort_dropped) and stays without it for this call.
+- LLM_MAX_TOKENS (default 3000): max_tokens when the caller passes none.
+- A 413 whose body mentions tokens (e.g. Groq's TPM "Request too large")
+  triggers one immediate retry on the same endpoint with max_tokens halved
+  (floor 1200), logged as max_tokens_reduced. Not counted against
+  MAX_ATTEMPTS; a second 413 is raised as before (no fallback).
 - DRY_RUN=1: no network; prompt is written to outputs/logs/dry/ instead.
 """
 from __future__ import annotations
@@ -34,6 +39,7 @@ BACKOFF_S = (2, 4, 8, 16, 32)  # BACKOFF_S[i] = sleep after failed attempt i+1
 DEFAULT_MAX_TOKENS = 3000
 ERROR_BODY_MAX = 300
 REASONING_PARAM = "reasoning_effort"
+MIN_REDUCED_MAX_TOKENS = 1200
 
 LOG_DIR: Path = config.ROOT / "outputs" / "logs"
 
@@ -135,6 +141,26 @@ def _rejects_reasoning_param(exc: Exception) -> bool:
     return REASONING_PARAM in text
 
 
+def _too_large_tokens(exc: Exception) -> bool:
+    """413 whose message/body mentions tokens (request too large for a TPM limit)."""
+    if _status(exc) != 413:
+        return False
+    return "token" in f"{exc} {getattr(exc, 'body', '') or ''}".lower()
+
+
+def _max_tokens_default() -> int:
+    raw = config.get("LLM_MAX_TOKENS")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_MAX_TOKENS
+    try:
+        val = int(raw)
+    except ValueError:
+        raise RuntimeError(f"LLM_MAX_TOKENS must be an integer, got {raw!r}") from None
+    if val <= 0:
+        raise RuntimeError(f"LLM_MAX_TOKENS must be positive, got {val}")
+    return val
+
+
 def _reasoning_effort() -> str | None:
     val = config.get("LLM_REASONING_EFFORT", "low")
     return None if val.lower() == "off" else val
@@ -178,10 +204,13 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
     """Try one endpoint up to MAX_ATTEMPTS times. Raises the last exception.
 
     A 400 that mentions reasoning_effort triggers one immediate extra attempt
-    without extra_body (not counted against MAX_ATTEMPTS)."""
+    without extra_body; a 413 that mentions tokens triggers one immediate extra
+    attempt with max_tokens halved (floor MIN_REDUCED_MAX_TOKENS). Neither
+    extra attempt counts against MAX_ATTEMPTS."""
     client = _get_client(ep)
     kwargs = {**base_kwargs, "model": ep.model}
     attempt = 0
+    reduced = False
     while attempt < MAX_ATTEMPTS:
         attempt += 1
         effort = (kwargs.get("extra_body") or {}).get(REASONING_PARAM)
@@ -190,6 +219,8 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
             resp = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - logged, then retried or re-raised
             dropping = effort is not None and _rejects_reasoning_param(exc)
+            shrinking = (not reduced and _too_large_tokens(exc)
+                         and kwargs["max_tokens"] > MIN_REDUCED_MAX_TOKENS)
             rec = {
                 "ts": _now(),
                 "model": ep.model,
@@ -203,10 +234,20 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
             }
             if dropping:
                 rec["reasoning_effort_dropped"] = True
+            if shrinking:
+                new_max = max(MIN_REDUCED_MAX_TOKENS, kwargs["max_tokens"] // 2)
+                rec["max_tokens_reduced"] = True
+                rec["max_tokens"] = kwargs["max_tokens"]
+                rec["max_tokens_next"] = new_max
             _append_log(rec)
             if dropping:
                 kwargs.pop("extra_body", None)
                 attempt -= 1  # the retry without the param is a free extra attempt
+                continue
+            if shrinking:
+                kwargs["max_tokens"] = new_max
+                reduced = True
+                attempt -= 1  # free extra attempt, like the reasoning drop
                 continue
             if attempt < MAX_ATTEMPTS and _is_retryable(exc):
                 time.sleep(BACKOFF_S[attempt - 1])
@@ -224,6 +265,7 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
             "attempt": attempt,
             "reasoning_effort": effort,
             "latency_ms": round((time.monotonic() - t0) * 1000),
+            "max_tokens": kwargs["max_tokens"],
             "usage": _usage_dict(resp.usage),
             "response": text,
         })
@@ -236,8 +278,11 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
 
 
 def complete(system: str, user: str, *, json_mode: bool = True,
-             max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
-    """Send one chat completion; return the raw response text."""
+             max_tokens: int | None = None) -> str:
+    """Send one chat completion; return the raw response text.
+    max_tokens=None uses LLM_MAX_TOKENS (default 3000)."""
+    if max_tokens is None:
+        max_tokens = _max_tokens_default()
     global last_model, last_response_model
     last_model = None
     last_response_model = None

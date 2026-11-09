@@ -84,6 +84,7 @@ def _status_err(code: int, body=None, msg: str | None = None) -> Exception:
         500: llm.openai.InternalServerError,
         503: llm.openai.InternalServerError,
         401: llm.openai.AuthenticationError,
+        413: llm.openai.APIStatusError,
     }[code]
     return cls(msg or f"err {code}", response=_fake_response(code), body=body)
 
@@ -132,6 +133,7 @@ def live(tmp_path, monkeypatch):
     KWARGS.clear()
     kwargs_seen = KWARGS
     monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
 
     class FakeOpenAI:
         def __init__(self, *, base_url, api_key, timeout, max_retries):
@@ -343,3 +345,80 @@ def test_error_log_falls_back_to_str_when_no_body(live):
     with pytest.raises(llm.openai.AuthenticationError):
         llm.complete("s", "u")
     assert "plain message" in _log(log)[0]["error"]
+
+
+# --- LLM_MAX_TOKENS and 413 self-healing --------------------------------------
+
+def _tpm_413():
+    return _status_err(413, body={"error": {"message": "Request too large for model on tokens "
+                                            "per minute (TPM): Limit 8000, Requested 8282"}})
+
+
+def test_max_tokens_from_env(live, monkeypatch):
+    script, calls, sleeps, log = live
+    script["prim"] = ["a", "b"]
+    monkeypatch.setenv("LLM_MAX_TOKENS", "2000")
+    llm.complete("s", "u")
+    llm.complete("s", "u", max_tokens=500)       # explicit argument wins
+    assert [k["max_tokens"] for k in KWARGS] == [2000, 500]
+    assert _log(log)[0]["max_tokens"] == 2000
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5"])
+def test_max_tokens_env_invalid(live, monkeypatch, bad):
+    monkeypatch.setenv("LLM_MAX_TOKENS", bad)
+    with pytest.raises(RuntimeError, match="LLM_MAX_TOKENS"):
+        llm.complete("s", "u")
+
+
+def test_413_tokens_retries_once_with_halved_max_tokens(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_tpm_413(), "ok smaller"]
+    script["fb-model"] = ["should not be used"]
+    assert llm.complete("s", "u") == "ok smaller"
+    assert calls == [("http://primary", "prim")] * 2 and sleeps == []
+    assert [k["max_tokens"] for k in KWARGS] == [3000, 1500]
+    recs = _log(log)
+    assert recs[0]["max_tokens_reduced"] is True and recs[0]["max_tokens_next"] == 1500
+    assert recs[0]["attempt"] == 1 and recs[1]["attempt"] == 1   # not counted
+    assert "max_tokens_reduced" not in recs[1] and recs[1]["max_tokens"] == 1500
+
+
+def test_413_halving_has_floor_1200(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_tpm_413(), "ok"]
+    llm.complete("s", "u", max_tokens=2000)
+    assert [k["max_tokens"] for k in KWARGS] == [2000, 1200]
+
+
+def test_413_only_reduced_once_then_raises(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_tpm_413(), _tpm_413()]
+    script["fb-model"] = ["should not be used"]
+    with pytest.raises(llm.openai.APIStatusError):
+        llm.complete("s", "u")
+    assert calls == [("http://primary", "prim")] * 2
+    assert [r.get("max_tokens_reduced", False) for r in _log(log)] == [True, False]
+
+
+def test_413_not_reduced_at_or_below_floor(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_tpm_413()]
+    with pytest.raises(llm.openai.APIStatusError):
+        llm.complete("s", "u", max_tokens=1200)
+    assert len(calls) == 1 and "max_tokens_reduced" not in _log(log)[0]
+
+
+def test_413_without_tokens_in_body_is_not_reduced(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_status_err(413, body={"error": {"message": "payload too big"}})]
+    with pytest.raises(llm.openai.APIStatusError):
+        llm.complete("s", "u")
+    assert len(calls) == 1
+
+
+def test_413_reduction_does_not_eat_retry_budget(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_tpm_413()] + [_status_err(429) for _ in range(4)] + ["ok"]
+    assert llm.complete("s", "u") == "ok"
+    assert len(calls) == 6 and [k["max_tokens"] for k in KWARGS][-1] == 1500

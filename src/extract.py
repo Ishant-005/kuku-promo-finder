@@ -259,7 +259,7 @@ def validate_response(raw: str, episode: Episode) -> ExtractionResult:
 
 def extract_episode(episode: Episode, *, max_tokens: int | None = None) -> ExtractionResult:
     """One LLM call for the episode, then code-side validation and dedupe.
-    max_tokens=None uses llm.DEFAULT_MAX_TOKENS."""
+    max_tokens=None uses LLM_MAX_TOKENS (default 3000)."""
     system, user = load_prompt(), build_user_message(episode)
     kw = {} if max_tokens is None else {"max_tokens": max_tokens}
     raw = llm.complete(system, user, json_mode=True, **kw)
