@@ -41,7 +41,17 @@ pip install -r requirements.txt
 cp .env.example .env    # then fill in LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 ```
 
-## Run
+## Web app (same pipeline, upload screenplays, any OpenAI-compatible model)
+
+```bash
+streamlit run app.py
+```
+
+Deployed demo: `<streamlit.app link>` — enter an endpoint/key/model in the sidebar
+(or use the pre-filled one), upload 2-3 episode `.txt` files, click **Find promos**.
+Deployment steps: `DEPLOY.md`.
+
+## Run (CLI)
 
 ```bash
 python run.py --input "data/<show folder>" --out outputs
