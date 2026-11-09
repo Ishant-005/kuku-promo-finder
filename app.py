@@ -88,13 +88,47 @@ def _parse_all(found: list[tuple[str, bytes]], out: Path):
     return episodes, errors
 
 
+PROVIDERS = {
+    "Custom": ("", ""),
+    "Groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+    "Cerebras": ("https://api.cerebras.ai/v1", "gpt-oss-120b"),
+    "Gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.8-flash"),
+    "Mistral": ("https://api.mistral.ai/v1", "mistral-small-latest"),
+    "OpenRouter": ("https://openrouter.ai/api/v1", ""),
+    "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
+    "Together": ("https://api.together.xyz/v1", ""),
+    "Ollama (local)": ("http://localhost:11434/v1", ""),
+}
+
+
+def _apply_preset() -> None:
+    name = st.session_state.get("provider_preset", "Custom")
+    url, model_id = PROVIDERS.get(name, ("", ""))
+    if url:
+        st.session_state["base_url_input"] = url
+    if model_id:
+        st.session_state["model_input"] = model_id
+    st.session_state["api_key_input"] = ""   # a new provider needs its own key
+    st.session_state["fallback_input"] = ""
+
+
 # --- sidebar: model endpoint ----------------------------------------------------
+
+
+for _k, _v in (("base_url_input", _secret("LLM_BASE_URL", "https://api.groq.com/openai/v1")),
+               ("api_key_input", _secret("LLM_API_KEY")),
+               ("model_input", _secret("LLM_MODEL", "openai/gpt-oss-120b")),
+               ("fallback_input", "")):
+    st.session_state.setdefault(_k, _v)
 
 with st.sidebar:
     st.header("Model endpoint")
     st.caption("Any OpenAI-compatible API. Swap the model here; the pipeline does not change.")
+    st.selectbox("Provider (fills the fields below — you can still edit them)", list(PROVIDERS),
+                 key="provider_preset", on_change=_apply_preset,
+                 help="Pick a provider to paste its base URL and a typical model id. Then add your key.")
     base_url = st.text_input(
-        "Base URL", _secret("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
+        "Base URL", key="base_url_input",
         help=(
             "The address of the provider's OpenAI-compatible API. The app sends every model call to "
             "`<Base URL>/chat/completions`, so any provider that speaks the OpenAI format works — only the "
@@ -111,12 +145,12 @@ with st.sidebar:
             "Copy it exactly, including any trailing slash. A wrong URL shows as a connection error or 404 in the run log."
         ),
     )
-    api_key = st.text_input("API key", _secret("LLM_API_KEY"), type="password",
+    api_key = st.text_input("API key", key="api_key_input", type="password",
                             help="Your key for the provider above. Used only for this session's calls; never stored by the app.")
-    model = st.text_input("Model", _secret("LLM_MODEL", "openai/gpt-oss-120b"),
+    model = st.text_input("Model", key="model_input",
                           help="The exact model id as the provider lists it, e.g. `openai/gpt-oss-120b` (Groq), "
                                "`gpt-oss-120b` (Cerebras), `mistral-small-latest` (Mistral). A wrong id shows as 404.")
-    fallback = st.text_input("Fallback model (optional, same endpoint)", "",
+    fallback = st.text_input("Fallback model (optional, same endpoint)", key="fallback_input",
                              help="Leave empty unless the endpoint above serves a second model you want tried when the first fails.")
     with st.expander("Advanced"):
         effort_choice = st.selectbox(
