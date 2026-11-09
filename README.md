@@ -45,7 +45,6 @@ cp .env.example .env     # fill in LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 python run.py --input "data/<show folder>" --out outputs
 ```
 
-**C. An endpoint someone hands you** (e.g. in an interview): same three values, either in the sidebar or in `.env`. If it is a reasoning model, `auto` mode sends `reasoning_effort=low`; if the provider rejects any parameter (`reasoning_effort`, `temperature`, `seed`), the wrapper drops that parameter and retries once, and logs that it did.
 
 ### Providers that have been run
 
