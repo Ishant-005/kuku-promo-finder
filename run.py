@@ -1,12 +1,16 @@
 """Promo finder CLI.
 
     python run.py --input "data/<show dir>" --out outputs [--episodes 1,10,25] [--force]
+    python run.py --out outputs --stages 3          # ranking only
 
 Stage 1: parse every screenplay in --input.
 Stage 2: extract each episode (one LLM call each), writing <out>/episodes/epNNN.json.
          Existing outputs are skipped unless --force. LLM_SLEEP_S (default 4)
          seconds between LLM calls. Per-episode failures go to
          <out>/logs/errors.log and the run continues.
+Stage 3: rank accepted candidates across episodes (src/rank.py, one LLM call),
+         writing <out>/promos.json, promos.csv, ranked.md.
+--stages picks which stages run (default 1,2,3); stage 2 needs stage 1's parse.
 Prints counts and reject reasons only, never script text.
 """
 from __future__ import annotations
@@ -19,7 +23,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import config, extract
+from src import config, extract, rank
 from src.models import Episode
 from src.parse import parse_show
 
@@ -33,6 +37,19 @@ def parse_episode_list(spec: str | None) -> set[int] | None:
         return {int(x) for x in spec.split(",") if x.strip()}
     except ValueError:
         raise argparse.ArgumentTypeError(f"--episodes must be comma-separated ints, got {spec!r}")
+
+
+VALID_STAGES = {1, 2, 3}
+
+
+def parse_stages(spec: str) -> set[int]:
+    try:
+        stages = {int(x) for x in spec.split(",") if x.strip()}
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--stages must be comma-separated ints, got {spec!r}")
+    if not stages or not stages <= VALID_STAGES:
+        raise argparse.ArgumentTypeError(f"--stages must be a subset of 1,2,3, got {spec!r}")
+    return stages
 
 
 def sleep_seconds() -> float:
@@ -120,45 +137,68 @@ def run_extract(episodes: list[Episode], out: Path, *, force: bool, sleep_s: flo
     return stats
 
 
+def print_rank_summary(res: dict) -> None:
+    print(f"  accepted loaded:  {res['loaded']}")
+    per_ep = res["top_per_episode"]
+    print(f"  top {rank.TOP_N}:           {res['top']} from {len(per_ep)} episodes "
+          f"(max per episode {max(per_ep.values(), default=0)}, "
+          f"{res['cap_dropped']} skipped by the {rank.PER_EP_CAP}-per-episode cap)")
+    print(f"  ranking model:    {res['model']} (served {res['response_model']})")
+    print(f"  ranking issues:   {res['issues'] or 'none'}")
+    print(f"  final:            {res['final']}")
+    for name, path in res["paths"].items():
+        print(f"  wrote {path}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--input", required=True, type=Path, help="folder of episode .txt files")
+    ap.add_argument("--input", type=Path, help="folder of episode .txt files (stages 1-2)")
     ap.add_argument("--out", default=config.ROOT / "outputs", type=Path)
     ap.add_argument("--episodes", type=parse_episode_list, default=None,
                     help='subset, e.g. "1,10,25"')
     ap.add_argument("--force", action="store_true", help="re-extract existing outputs")
+    ap.add_argument("--stages", type=parse_stages, default={1, 2, 3},
+                    help='stages to run, e.g. "3" (default "1,2,3")')
     args = ap.parse_args(argv)
 
-    if not args.input.is_dir():
-        print(f"--input is not a directory: {args.input}", file=sys.stderr)
-        return 2
+    failed = 0
+    if args.stages & {1, 2}:
+        if args.input is None or not args.input.is_dir():
+            print(f"--input is not a directory: {args.input}", file=sys.stderr)
+            return 2
 
-    # Stage 1
-    episodes = parse_show(args.input)
-    print(f"stage 1: parsed {len(episodes)} episodes from {args.input.name}")
-    if args.episodes is not None:
-        missing = sorted(args.episodes - {e.number for e in episodes})
-        episodes = [e for e in episodes if e.number in args.episodes]
-        if missing:
-            print(f"warning: episodes not found: {missing}")
+        # Stage 1
+        episodes = parse_show(args.input)
+        print(f"stage 1: parsed {len(episodes)} episodes from {args.input.name}")
+        if args.episodes is not None:
+            missing = sorted(args.episodes - {e.number for e in episodes})
+            episodes = [e for e in episodes if e.number in args.episodes]
+            if missing:
+                print(f"warning: episodes not found: {missing}")
 
-    # Stage 2
-    sleep_s = sleep_seconds()
-    print(f"stage 2: extracting {len(episodes)} episodes (sleep {sleep_s:g}s between calls)")
-    stats = run_extract(episodes, args.out, force=args.force, sleep_s=sleep_s)
+    if 2 in args.stages:
+        sleep_s = sleep_seconds()
+        print(f"stage 2: extracting {len(episodes)} episodes (sleep {sleep_s:g}s between calls)")
+        stats = run_extract(episodes, args.out, force=args.force, sleep_s=sleep_s)
 
-    if stats["durations"]:
-        print_durations(stats["durations"])
+        if stats["durations"]:
+            print_durations(stats["durations"])
 
-    print("\nsummary")
-    print(f"  episodes done:    {stats['done']}")
-    print(f"  episodes skipped: {stats['skipped']}")
-    print(f"  episodes failed:  {stats['failed']}")
-    print(f"  accepted:         {stats['accepted']}")
-    print(f"  rejected:         {sum(stats['rejected'].values())}")
-    for reason, n in stats["rejected"].most_common():
-        print(f"    {reason:<26} {n}")
-    return 1 if stats["failed"] else 0
+        print("\nsummary")
+        print(f"  episodes done:    {stats['done']}")
+        print(f"  episodes skipped: {stats['skipped']}")
+        print(f"  episodes failed:  {stats['failed']}")
+        print(f"  accepted:         {stats['accepted']}")
+        print(f"  rejected:         {sum(stats['rejected'].values())}")
+        for reason, n in stats["rejected"].most_common():
+            print(f"    {reason:<26} {n}")
+        failed = stats["failed"]
+
+    if 3 in args.stages:
+        print("\nstage 3: ranking")
+        print_rank_summary(rank.rank_all(args.out))
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

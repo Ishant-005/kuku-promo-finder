@@ -89,3 +89,20 @@ def test_durations_logged_and_printed(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "e001-c1" in out and "too_short" in out and "declared missing: 1" in out
     assert "|delta| mean 2.0s  max 2.0s" in out
+
+
+def test_parse_stages():
+    assert run.parse_stages("3") == {3}
+    assert run.parse_stages("1,2,3") == {1, 2, 3}
+    for bad in ("4", "", "x"):
+        with pytest.raises(Exception):
+            run.parse_stages(bad)
+
+
+def test_stage3_only_needs_no_input(tmp_path, monkeypatch):
+    called = {}
+    monkeypatch.setattr(run.rank, "rank_all", lambda out: called.setdefault("out", out) and {
+        "loaded": 0, "top_per_episode": {}, "top": 0, "cap_dropped": 0, "model": None,
+        "response_model": None, "issues": {}, "final": 0, "paths": {}})
+    assert run.main(["--out", str(tmp_path), "--stages", "3"]) == 0
+    assert called["out"] == tmp_path
