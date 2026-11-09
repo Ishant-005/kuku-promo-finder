@@ -291,16 +291,18 @@ def rank_all(out: Path, *, complete_fn=None) -> dict:
     top, dropped = select_top(ranked)
     issues: Counter = Counter()
     picks: list[tuple[str, str]] = []
-    model = response_model = None
+    model = response_model = phash = None
     if top:
         system, user = load_prompt(), build_cards(top)
+        phash = llm._prompt_hash(system, user)
         raw = complete_fn(system, user, json_mode=True)
         model, response_model = llm.last_model, llm.last_response_model
         picks, issues = parse_ranking(raw, {p.candidate_id for p in top})
     final = final_order(top, picks, issues)
     meta = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "model": model, "response_model": response_model, "loaded": len(promos),
+        "model": model, "response_model": response_model, "prompt_hash": phash,
+        "loaded": len(promos),
         "cap_dropped": len(dropped), "issues": dict(issues),
     }
     paths = write_outputs(out, final, top, dropped, meta)

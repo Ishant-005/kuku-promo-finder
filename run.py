@@ -10,7 +10,11 @@ Stage 2: extract each episode (one LLM call each), writing <out>/episodes/epNNN.
          <out>/logs/errors.log and the run continues.
 Stage 3: rank accepted candidates across episodes (src/rank.py, one LLM call),
          writing <out>/promos.json, promos.csv, ranked.md.
---stages picks which stages run (default 1,2,3); stage 2 needs stage 1's parse.
+Stage 4: cold-viewer audit of the final promos (src/audit.py, one small LLM call
+         each, AUDIT_SLEEP_S default 5 s apart) -> <out>/audit.json + audit table
+         in ranked.md; then <out>/stats.md (src/stats.py).
+--stages picks which stages run (default 1,2,3,4). Stages 2 and 4 need --input
+(the parse from stage 1); stage 3 does not.
 Prints counts and reject reasons only, never script text.
 """
 from __future__ import annotations
@@ -23,7 +27,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import config, extract, rank
+from src import audit, config, extract, rank, stats
 from src.models import Episode
 from src.parse import parse_show
 
@@ -39,7 +43,7 @@ def parse_episode_list(spec: str | None) -> set[int] | None:
         raise argparse.ArgumentTypeError(f"--episodes must be comma-separated ints, got {spec!r}")
 
 
-VALID_STAGES = {1, 2, 3}
+VALID_STAGES = {1, 2, 3, 4}
 
 
 def parse_stages(spec: str) -> set[int]:
@@ -48,7 +52,7 @@ def parse_stages(spec: str) -> set[int]:
     except ValueError:
         raise argparse.ArgumentTypeError(f"--stages must be comma-separated ints, got {spec!r}")
     if not stages or not stages <= VALID_STAGES:
-        raise argparse.ArgumentTypeError(f"--stages must be a subset of 1,2,3, got {spec!r}")
+        raise argparse.ArgumentTypeError(f"--stages must be a subset of 1,2,3,4, got {spec!r}")
     return stages
 
 
@@ -152,23 +156,25 @@ def print_rank_summary(res: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--input", type=Path, help="folder of episode .txt files (stages 1-2)")
+    ap.add_argument("--input", type=Path,
+                    help="folder of episode .txt files (stages 1, 2, 4)")
     ap.add_argument("--out", default=config.ROOT / "outputs", type=Path)
     ap.add_argument("--episodes", type=parse_episode_list, default=None,
                     help='subset, e.g. "1,10,25"')
     ap.add_argument("--force", action="store_true", help="re-extract existing outputs")
-    ap.add_argument("--stages", type=parse_stages, default={1, 2, 3},
-                    help='stages to run, e.g. "3" (default "1,2,3")')
+    ap.add_argument("--stages", type=parse_stages, default={1, 2, 3, 4},
+                    help='stages to run, e.g. "3" or "4" (default "1,2,3,4")')
     args = ap.parse_args(argv)
 
     failed = 0
-    if args.stages & {1, 2}:
+    all_episodes: list[Episode] = []
+    if args.stages & {1, 2, 4}:
         if args.input is None or not args.input.is_dir():
             print(f"--input is not a directory: {args.input}", file=sys.stderr)
             return 2
 
         # Stage 1
-        episodes = parse_show(args.input)
+        all_episodes = episodes = parse_show(args.input)
         print(f"stage 1: parsed {len(episodes)} episodes from {args.input.name}")
         if args.episodes is not None:
             missing = sorted(args.episodes - {e.number for e in episodes})
@@ -179,24 +185,38 @@ def main(argv: list[str] | None = None) -> int:
     if 2 in args.stages:
         sleep_s = sleep_seconds()
         print(f"stage 2: extracting {len(episodes)} episodes (sleep {sleep_s:g}s between calls)")
-        stats = run_extract(episodes, args.out, force=args.force, sleep_s=sleep_s)
+        ex_stats = run_extract(episodes, args.out, force=args.force, sleep_s=sleep_s)
 
-        if stats["durations"]:
-            print_durations(stats["durations"])
+        if ex_stats["durations"]:
+            print_durations(ex_stats["durations"])
 
         print("\nsummary")
-        print(f"  episodes done:    {stats['done']}")
-        print(f"  episodes skipped: {stats['skipped']}")
-        print(f"  episodes failed:  {stats['failed']}")
-        print(f"  accepted:         {stats['accepted']}")
-        print(f"  rejected:         {sum(stats['rejected'].values())}")
-        for reason, n in stats["rejected"].most_common():
+        print(f"  episodes done:    {ex_stats['done']}")
+        print(f"  episodes skipped: {ex_stats['skipped']}")
+        print(f"  episodes failed:  {ex_stats['failed']}")
+        print(f"  accepted:         {ex_stats['accepted']}")
+        print(f"  rejected:         {sum(ex_stats['rejected'].values())}")
+        for reason, n in ex_stats["rejected"].most_common():
             print(f"    {reason:<26} {n}")
-        failed = stats["failed"]
+        failed = ex_stats["failed"]
 
     if 3 in args.stages:
         print("\nstage 3: ranking")
         print_rank_summary(rank.rank_all(args.out))
+
+    if 4 in args.stages:
+        t0 = time.monotonic()
+        sleep_s = audit.sleep_seconds()
+        print(f"\nstage 4: audit (sleep {sleep_s:g}s between calls)")
+        res = audit.audit_all(args.out, all_episodes, sleep_s=sleep_s)
+        print(f"  audited: {res['audited']}  ok: {res['ok']}  errors: {res['errors']}  "
+              f"|delta|>=2: {res['big_deltas']}")
+        path, _ = stats.write_stats(args.out, n_parsed=len(all_episodes),
+                                    stage_seconds=time.monotonic() - t0)
+        print(f"  wrote {args.out / 'audit.json'}, appended audit table to "
+              f"{args.out / 'ranked.md'}")
+        print(f"  wrote {path}")
+        failed += res["errors"]
 
     return 1 if failed else 0
 

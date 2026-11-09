@@ -94,7 +94,7 @@ def test_durations_logged_and_printed(tmp_path, capsys):
 def test_parse_stages():
     assert run.parse_stages("3") == {3}
     assert run.parse_stages("1,2,3") == {1, 2, 3}
-    for bad in ("4", "", "x"):
+    for bad in ("5", "", "x"):
         with pytest.raises(Exception):
             run.parse_stages(bad)
 
@@ -106,3 +106,20 @@ def test_stage3_only_needs_no_input(tmp_path, monkeypatch):
         "response_model": None, "issues": {}, "final": 0, "paths": {}})
     assert run.main(["--out", str(tmp_path), "--stages", "3"]) == 0
     assert called["out"] == tmp_path
+
+
+def test_stage4_runs_audit_then_stats(tmp_path, monkeypatch):
+    eps = [_ep(1)]
+    monkeypatch.setattr(run, "parse_show", lambda d: eps)
+    seen = {}
+    monkeypatch.setattr(run.audit, "audit_all", lambda out, episodes, sleep_s: seen.update(
+        eps=episodes, sleep=sleep_s) or {"audited": 1, "ok": 1, "errors": 0, "big_deltas": 0})
+    monkeypatch.setattr(run.audit, "sleep_seconds", lambda: 5.0)
+    monkeypatch.setattr(run.stats, "write_stats", lambda out, **kw: seen.update(kw=kw) or (
+        out / "stats.md", {}))
+    assert run.main(["--input", str(tmp_path), "--out", str(tmp_path), "--stages", "4"]) == 0
+    assert seen["eps"] == eps and seen["sleep"] == 5.0 and seen["kw"]["n_parsed"] == 1
+
+
+def test_stage4_requires_input(tmp_path):
+    assert run.main(["--out", str(tmp_path), "--stages", "4"]) == 2
