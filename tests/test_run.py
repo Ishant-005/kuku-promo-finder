@@ -121,5 +121,36 @@ def test_stage4_runs_audit_then_stats(tmp_path, monkeypatch):
     assert seen["eps"] == eps and seen["sleep"] == 5.0 and seen["kw"]["n_parsed"] == 1
 
 
-def test_stage4_requires_input(tmp_path):
+def test_stage4_requires_input(tmp_path, monkeypatch):
+    monkeypatch.setattr(run.config, "ROOT", tmp_path)  # no data/ folder -> no default
     assert run.main(["--out", str(tmp_path), "--stages", "4"]) == 2
+
+
+def test_default_input_only_when_single_folder(tmp_path):
+    data = tmp_path / "data"
+    assert run.default_input(data) is None  # missing
+    data.mkdir()
+    (data / "pack.zip").write_text("")
+    (data / ".hidden").mkdir()
+    assert run.default_input(data) is None  # no show folder
+    (data / "show_a").mkdir()
+    assert run.default_input(data) == data / "show_a"
+    (data / "show_b").mkdir()
+    assert run.default_input(data) is None  # ambiguous
+
+
+def test_main_uses_default_input(tmp_path, monkeypatch):
+    (tmp_path / "data" / "show").mkdir(parents=True)
+    monkeypatch.setattr(run.config, "ROOT", tmp_path)
+    seen = {}
+    monkeypatch.setattr(run, "parse_show", lambda d: seen.setdefault("dir", d) and [])
+    assert run.main(["--out", str(tmp_path / "o"), "--stages", "1"]) == 0
+    assert seen["dir"] == tmp_path / "data" / "show"
+
+
+def test_default_out_separates_dry_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(run.config, "ROOT", tmp_path)
+    monkeypatch.setenv("DRY_RUN", "0")
+    assert run.default_out() == tmp_path / "outputs"
+    monkeypatch.setenv("DRY_RUN", "1")
+    assert run.default_out() == tmp_path / "outputs" / "dry"

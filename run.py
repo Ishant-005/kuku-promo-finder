@@ -14,7 +14,10 @@ Stage 4: cold-viewer audit of the final promos (src/audit.py, one small LLM call
          each, AUDIT_SLEEP_S default 5 s apart) -> <out>/audit.json + audit table
          in ranked.md; then <out>/stats.md (src/stats.py).
 --stages picks which stages run (default 1,2,3,4). Stages 2 and 4 need --input
-(the parse from stage 1); stage 3 does not.
+(the parse from stage 1); stage 3 does not. If --input is omitted and data/
+holds exactly one folder, that folder is used.
+--out defaults to outputs/, or outputs/dry/ when DRY_RUN=1 (so a dry run never
+overwrites real results).
 Prints counts and reject reasons only, never script text.
 """
 from __future__ import annotations
@@ -62,6 +65,18 @@ def sleep_seconds() -> float:
         return max(0.0, float(raw))
     except ValueError:
         raise RuntimeError(f"LLM_SLEEP_S must be a number, got {raw!r}") from None
+
+
+def default_input(data_dir: Path) -> Path | None:
+    """The single subfolder of data_dir, or None if there are zero or several."""
+    if not data_dir.is_dir():
+        return None
+    dirs = [d for d in data_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    return dirs[0] if len(dirs) == 1 else None
+
+
+def default_out() -> Path:
+    return config.ROOT / "outputs" / ("dry" if config.dry_run() else "")
 
 
 def reason_key(reason: str) -> str:
@@ -158,17 +173,22 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--input", type=Path,
                     help="folder of episode .txt files (stages 1, 2, 4)")
-    ap.add_argument("--out", default=config.ROOT / "outputs", type=Path)
+    ap.add_argument("--out", default=None, type=Path,
+                    help="output folder (default outputs/, or outputs/dry/ when DRY_RUN=1)")
     ap.add_argument("--episodes", type=parse_episode_list, default=None,
                     help='subset, e.g. "1,10,25"')
     ap.add_argument("--force", action="store_true", help="re-extract existing outputs")
     ap.add_argument("--stages", type=parse_stages, default={1, 2, 3, 4},
                     help='stages to run, e.g. "3" or "4" (default "1,2,3,4")')
     args = ap.parse_args(argv)
+    if args.out is None:
+        args.out = default_out()
 
     failed = 0
     all_episodes: list[Episode] = []
     if args.stages & {1, 2, 4}:
+        if args.input is None:
+            args.input = default_input(config.ROOT / "data")
         if args.input is None or not args.input.is_dir():
             print(f"--input is not a directory: {args.input}", file=sys.stderr)
             return 2
