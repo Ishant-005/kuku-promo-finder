@@ -96,7 +96,8 @@ with st.sidebar:
     base_url = st.text_input("Base URL", _secret("LLM_BASE_URL", "https://api.groq.com/openai/v1"))
     api_key = st.text_input("API key", _secret("LLM_API_KEY"), type="password")
     model = st.text_input("Model", _secret("LLM_MODEL", "openai/gpt-oss-120b"))
-    fallback = st.text_input("Fallback model (optional, same endpoint)", _secret("LLM_FALLBACK_MODEL", "openai/gpt-oss-20b"))
+    fallback = st.text_input("Fallback model (optional, same endpoint)", "",
+                             help="Leave empty unless the endpoint above serves a second model you want tried when the first fails.")
     with st.expander("Advanced"):
         effort = st.selectbox("Reasoning effort (reasoning models only)", ["low", "medium", "high", "off"],
                               index=["low", "medium", "high", "off"].index(_secret("LLM_REASONING_EFFORT", "low")))
@@ -124,7 +125,7 @@ st.write(
     "validates (20–60 s, no mid-line cuts, no duplicates) and ranks."
 )
 
-tab_run, tab_view, tab_about = st.tabs(["Run on screenplays", "View a previous run", "How it works"])
+tab_run, tab_view, tab_manual, tab_about = st.tabs(["Run on screenplays", "View a previous run", "User manual", "How it works"])
 
 with tab_run:
     files = st.file_uploader("Screenplays (.txt) or a .zip of them", type=["txt", "zip"],
@@ -153,9 +154,18 @@ with tab_run:
             st.metric("LLM calls", est)
             st.caption(f"≈ {len(chosen) * sleep_s / 60:.0f} min at current sleep")
 
-        if st.button("Find promos", type="primary", disabled=not chosen or not api_key):
-            if not api_key:
-                st.error("Enter an API key in the sidebar.")
+        blockers = []
+        if not api_key:
+            blockers.append("enter an **API key** in the sidebar")
+        if not base_url:
+            blockers.append("enter a **Base URL** in the sidebar")
+        if not model:
+            blockers.append("enter a **Model** name in the sidebar")
+        if not chosen:
+            blockers.append("select at least one **episode** above")
+        if blockers:
+            st.info("**Find promos** is disabled until you " + "; ".join(blockers) + ".")
+        if st.button("Find promos", type="primary", disabled=bool(blockers)):
             run_eps = [e for e in episodes if e.number in chosen]
             prog = st.progress(0.0, text="Extracting…")
             log = st.empty()
@@ -260,6 +270,42 @@ with tab_view:
             st.dataframe(pd.read_csv(prev), use_container_width=True, hide_index=True)
         else:
             st.markdown(prev.read().decode("utf-8", errors="replace"))
+
+with tab_manual:
+    st.markdown(
+        """
+### User manual
+
+**What you need**
+- The screenplays: one `.txt` per episode in the Kuku format (scene headings, timestamped CAMERA / ACTION / dialogue blocks). A `.zip` of them also works.
+- An API key for any OpenAI-compatible LLM endpoint. Free options: Groq (`https://api.groq.com/openai/v1`), Gemini (`https://generativelanguage.googleapis.com/v1beta/openai/`), Cerebras, Mistral. If the sidebar is already filled in, a key has been provided for you.
+
+**Step by step**
+1. **Sidebar → Model endpoint.** Paste the Base URL, API key and the exact model id the provider lists (e.g. `openai/gpt-oss-120b` on Groq). A wrong model id gives a `404` in the run log. Leave *Fallback model* empty unless you know a second model on the *same* endpoint.
+2. **Upload screenplays.** Drag the `.txt` files (or a `.zip`) into the uploader. The green bar confirms how many episodes parsed and how many beats were found. A parse warning means that file's format differs; it is skipped.
+3. **Pick episodes.** The first 3 are pre-selected. Each episode is one LLM call. On a free tier, 3–5 episodes is a sensible demo; the full 50-episode run takes ~30 minutes because of rate limits.
+4. **Cold-viewer audit (optional).** Adds one small call per final promo (up to 15). It re-reads each clip with no show context and scores how followable it is to a stranger. Turn it off when you are short on quota.
+5. **Click Find promos.** The log shows one line per episode: accepted / rejected counts, which model answered, time taken. Then one ranking call, then (optionally) the audit.
+6. **Read the results.** The table lists the final promos in posting order with episode, start–end timestamps, duration, hook, cliffhanger, why it works and the 1–5 scores. Download `promos.csv`, `promos.json` or `ranked.md` for the editor.
+7. **Check the rejections.** The *Rejected candidates* expander shows every proposal the validator threw out and why (unknown beat id, too short/long, cut inside a line, duplicate). This is where to look if an episode returned nothing.
+
+**Advanced (sidebar → Advanced)**
+- *Reasoning effort* — `low` for reasoning models (gpt-oss, Gemini thinking); `off` for plain chat models that reject the parameter.
+- *Max completion tokens* — 3000 is enough; lower it to 2000 if the provider returns `413` (request too large for a free-tier minute).
+- *Seconds between episodes* — raise it if you see `429` rate-limit errors; 20–30 s suits Groq's free tier.
+
+**Reading errors in the run log**
+- `404` → model id does not exist on that endpoint. Check the provider's model list.
+- `401` → wrong API key.
+- `429` → rate limit. Increase the pause, or wait; daily caps (Gemini free: 20 requests/day per model) reset at midnight Pacific.
+- `413` → request too large for the per-minute token budget. Lower max tokens.
+- `json_validate_failed` / empty output → the model spent its budget reasoning. Set reasoning effort to `low`, or pick a non-reasoning model.
+
+**Same episode, different results?** LLM output is sampled; temperature is pinned to 0 to reduce this, but providers are not perfectly deterministic. If every candidate in an episode is rejected for `unknown_id`, the pipeline re-asks once automatically.
+
+**Privacy.** Uploaded scripts stay in a temporary folder for this browser session only and are never stored or displayed; results quote only the hook and cliffhanger lines.
+        """
+    )
 
 with tab_about:
     st.markdown(
