@@ -112,7 +112,7 @@ with st.sidebar:
                "`https://generativelanguage.googleapis.com/v1beta/openai/` · OpenAI `https://api.openai.com/v1`")
 
 
-REASONING_PATTERNS = ("gpt-oss", "o1", "o3", "o4", "deepseek-r1", "r1-", "qwen3", "thinking",
+REASONING_PATTERNS = ("gpt-oss", "o1", "o3", "o4", "deepseek-r1", "r1-", "qwen3", "qwen-3", "qwq", "thinking",
                       "gemini-2.5", "gemini-3", "grok-3-mini", "grok-4", "sonar-reasoning")
 
 
@@ -191,6 +191,12 @@ with tab_run:
             st.info("**Find promos** is disabled until you " + "; ".join(blockers) + ".")
         if st.button("Find promos", type="primary", disabled=bool(blockers)):
             run_eps = [e for e in episodes if e.number in chosen]
+            # fresh run: drop results from any earlier run in this session
+            import shutil
+            shutil.rmtree(out / "episodes", ignore_errors=True)
+            for stale in ("promos.json", "promos.csv", "ranked.md", "audit.json", "stats.md"):
+                (out / stale).unlink(missing_ok=True)
+            st.session_state.ran = False
             prog = st.progress(0.0, text="Extracting…")
             log = st.empty()
             lines: list[str] = []
@@ -215,12 +221,23 @@ with tab_run:
                     failed += 1
                     lines.append(f"ep{ep.number:03d} FAILED {type(exc).__name__}: {str(exc)[:160]}")
                 log.code("\n".join(lines))
-            prog.progress(1.0, text="Ranking (one LLM call)…")
-            try:
-                rres = rank.rank_all(out)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Ranking failed: {type(exc).__name__}: {exc}")
-                rres = None
+            rres = None
+            if accepted == 0:
+                prog.progress(1.0, text="Stopped: nothing to rank")
+                if failed == len(run_eps):
+                    st.error("Every episode failed before validation (see the log above). Usually a wrong model id (404), "
+                             "a key problem (401), a rate limit (429), or a model that returned no JSON — "
+                             "try a different model or set Reasoning effort to `low`.")
+                else:
+                    st.warning("The model answered, but every proposed clip was rejected by the validator "
+                               "(unknown beat IDs, bad length, mid-line cuts). Open the rejected-candidates list below, "
+                               "or re-run — a retry often succeeds.")
+            else:
+                prog.progress(1.0, text="Ranking (one LLM call)…")
+                try:
+                    rres = rank.rank_all(out)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Ranking failed: {type(exc).__name__}: {exc}")
             if do_audit and rres:
                 prog.progress(1.0, text="Cold-viewer audit…")
                 try:
@@ -231,8 +248,22 @@ with tab_run:
                 stats.write_stats(out, n_parsed=len(episodes))
             except Exception:  # noqa: BLE001
                 pass
-            prog.progress(1.0, text=f"Done in {time.monotonic()-t_start:.0f}s")
-            st.session_state.ran = True
+            if rres:
+                prog.progress(1.0, text=f"Done in {time.monotonic()-t_start:.0f}s")
+                st.session_state.ran = True
+
+    if (out / "episodes").exists() and not st.session_state.get("ran") and any((out / "episodes").glob("ep*.json")):
+        with st.expander("Rejected candidates from this run", expanded=True):
+            rows = []
+            for ej in sorted((out / "episodes").glob("ep*.json")):
+                d = json.loads(ej.read_text(encoding="utf-8"))
+                for c in d.get("rejected", []):
+                    segs = c.get("segments") or []
+                    rows.append({"episode": d.get("episode"), "candidate": c.get("candidate_id"),
+                                 "reason": c.get("reject_reason"),
+                                 "proposed_ids": "; ".join(f"{x.get('start_id')}→{x.get('end_id')}" for x in segs),
+                                 "model": d.get("response_model") or d.get("model")})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True) if rows else st.write("No rejections recorded.")
 
     if st.session_state.get("ran") and (out / "promos.csv").exists():
         st.subheader("Ranked promos")
