@@ -13,6 +13,10 @@
   extra_body={"reasoning_effort": ...}. If an endpoint answers 400 and the
   error mentions the parameter, that endpoint is retried once without it
   (logged as reasoning_effort_dropped) and stays without it for this call.
+- LLM_TEMPERATURE (default 0) and seed=42 are sent on every call. Same rule:
+  a 400 naming "temperature" / "seed" retries once on that endpoint without
+  that parameter (logged as temperature_dropped / seed_dropped). Each
+  parameter is dropped at most once per endpoint; the fallback starts fresh.
 - LLM_MAX_TOKENS (default 3000): max_tokens when the caller passes none.
 - A 413 whose body mentions tokens (e.g. Groq's TPM "Request too large")
   triggers one immediate retry on the same endpoint with max_tokens halved
@@ -24,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +44,11 @@ BACKOFF_S = (2, 4, 8, 16, 32)  # BACKOFF_S[i] = sleep after failed attempt i+1
 DEFAULT_MAX_TOKENS = 3000
 ERROR_BODY_MAX = 300
 REASONING_PARAM = "reasoning_effort"
+SEED = 42
+DEFAULT_TEMPERATURE = 0.0
+# Optional parameters a provider may reject with a 400. Checked in this order;
+# the first one named in the error body AND still being sent is dropped.
+DROPPABLE_PARAMS = (REASONING_PARAM, "temperature", "seed")
 MIN_REDUCED_MAX_TOKENS = 1200
 
 LOG_DIR: Path = config.ROOT / "outputs" / "logs"
@@ -133,12 +143,36 @@ def _error_body(exc: Exception) -> str:
     return text[:ERROR_BODY_MAX]
 
 
-def _rejects_reasoning_param(exc: Exception) -> bool:
-    """400 whose message/body mentions the reasoning parameter."""
+def _sent_params(kwargs: dict) -> list[str]:
+    """Droppable parameters present in this request."""
+    sent = []
+    for p in DROPPABLE_PARAMS:
+        if p == REASONING_PARAM:
+            if (kwargs.get("extra_body") or {}).get(REASONING_PARAM) is not None:
+                sent.append(p)
+        elif p in kwargs:
+            sent.append(p)
+    return sent
+
+
+def _rejected_param(exc: Exception, kwargs: dict) -> str | None:
+    """Name of a droppable parameter that this 400 complains about and that
+    the request actually sent, else None. Whole-word match ("seed" must not
+    match inside another word)."""
     if _status(exc) != 400:
-        return False
+        return None
     text = f"{exc} {getattr(exc, 'body', '') or ''}".lower()
-    return REASONING_PARAM in text
+    for p in _sent_params(kwargs):
+        if re.search(rf"(?<![a-z_]){re.escape(p)}(?![a-z_])", text):
+            return p
+    return None
+
+
+def _drop_param(kwargs: dict, param: str) -> None:
+    if param == REASONING_PARAM:
+        kwargs.pop("extra_body", None)
+    else:
+        kwargs.pop(param, None)
 
 
 def _too_large_tokens(exc: Exception) -> bool:
@@ -158,6 +192,19 @@ def _max_tokens_default() -> int:
         raise RuntimeError(f"LLM_MAX_TOKENS must be an integer, got {raw!r}") from None
     if val <= 0:
         raise RuntimeError(f"LLM_MAX_TOKENS must be positive, got {val}")
+    return val
+
+
+def _temperature() -> float:
+    raw = config.get("LLM_TEMPERATURE")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_TEMPERATURE
+    try:
+        val = float(raw)
+    except ValueError:
+        raise RuntimeError(f"LLM_TEMPERATURE must be a number, got {raw!r}") from None
+    if val < 0:
+        raise RuntimeError(f"LLM_TEMPERATURE must be >= 0, got {val}")
     return val
 
 
@@ -203,8 +250,8 @@ def _dry_run(system: str, user: str, json_mode: bool, max_tokens: int, phash: st
 def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_used: bool) -> str:
     """Try one endpoint up to MAX_ATTEMPTS times. Raises the last exception.
 
-    A 400 that mentions reasoning_effort triggers one immediate extra attempt
-    without extra_body; a 413 that mentions tokens triggers one immediate extra
+    A 400 that names a droppable parameter still being sent (reasoning_effort,
+    temperature, seed) triggers one immediate extra attempt without it; a 413 that mentions tokens triggers one immediate extra
     attempt with max_tokens halved (floor MIN_REDUCED_MAX_TOKENS). Neither
     extra attempt counts against MAX_ATTEMPTS."""
     client = _get_client(ep)
@@ -218,7 +265,7 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
         try:
             resp = client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - logged, then retried or re-raised
-            dropping = effort is not None and _rejects_reasoning_param(exc)
+            dropping = _rejected_param(exc, kwargs)
             shrinking = (not reduced and _too_large_tokens(exc)
                          and kwargs["max_tokens"] > MIN_REDUCED_MAX_TOKENS)
             rec = {
@@ -228,12 +275,14 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
                 "fallback_used": fallback_used,
                 "attempt": attempt,
                 "reasoning_effort": effort,
+                "temperature": kwargs.get("temperature"),
+                "seed": kwargs.get("seed"),
                 "latency_ms": round((time.monotonic() - t0) * 1000),
                 "usage": None,
                 "error": f"{type(exc).__name__}: {_status(exc) or ''} {_error_body(exc)}",
             }
             if dropping:
-                rec["reasoning_effort_dropped"] = True
+                rec[f"{dropping}_dropped"] = True
             if shrinking:
                 new_max = max(MIN_REDUCED_MAX_TOKENS, kwargs["max_tokens"] // 2)
                 rec["max_tokens_reduced"] = True
@@ -241,7 +290,7 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
                 rec["max_tokens_next"] = new_max
             _append_log(rec)
             if dropping:
-                kwargs.pop("extra_body", None)
+                _drop_param(kwargs, dropping)
                 attempt -= 1  # the retry without the param is a free extra attempt
                 continue
             if shrinking:
@@ -264,6 +313,8 @@ def _call_with_retries(ep: _Endpoint, base_kwargs: dict, phash: str, fallback_us
             "fallback_used": fallback_used,
             "attempt": attempt,
             "reasoning_effort": effort,
+            "temperature": kwargs.get("temperature"),
+            "seed": kwargs.get("seed"),
             "latency_ms": round((time.monotonic() - t0) * 1000),
             "max_tokens": kwargs["max_tokens"],
             "usage": _usage_dict(resp.usage),
@@ -296,6 +347,8 @@ def complete(system: str, user: str, *, json_mode: bool = True,
             {"role": "user", "content": user},
         ],
         "max_tokens": max_tokens,
+        "temperature": _temperature(),
+        "seed": SEED,
     }
     if json_mode:
         base_kwargs["response_format"] = {"type": "json_object"}

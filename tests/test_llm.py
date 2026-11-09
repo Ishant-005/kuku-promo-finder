@@ -134,6 +134,7 @@ def live(tmp_path, monkeypatch):
     kwargs_seen = KWARGS
     monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
 
     class FakeOpenAI:
         def __init__(self, *, base_url, api_key, timeout, max_retries):
@@ -422,3 +423,84 @@ def test_413_reduction_does_not_eat_retry_budget(live):
     script["prim"] = [_tpm_413()] + [_status_err(429) for _ in range(4)] + ["ok"]
     assert llm.complete("s", "u") == "ok"
     assert len(calls) == 6 and [k["max_tokens"] for k in KWARGS][-1] == 1500
+
+
+# ---------------------------------------------------------------------------
+# temperature / seed
+# ---------------------------------------------------------------------------
+
+def _param_400(param: str):
+    body = {"error": {"message": f"Unsupported parameter: '{param}' is not supported "
+                                 "with this model.", "type": "invalid_request_error"}}
+    return _status_err(400, body=body, msg="Error code: 400")
+
+
+def test_temperature_0_and_seed_42_sent_by_default(live):
+    script, calls, sleeps, log = live
+    script["prim"] = ["ok"]
+    llm.complete("s", "u")
+    (kw,) = KWARGS
+    assert kw["temperature"] == 0.0 and kw["seed"] == 42
+    rec = _log(log)[0]
+    assert rec["temperature"] == 0.0 and rec["seed"] == 42
+
+
+def test_temperature_from_env(live, monkeypatch):
+    script, calls, sleeps, log = live
+    monkeypatch.setenv("LLM_TEMPERATURE", "1")
+    script["prim"] = ["ok"]
+    llm.complete("s", "u")
+    assert KWARGS[0]["temperature"] == 1.0 and KWARGS[0]["seed"] == 42
+
+
+@pytest.mark.parametrize("bad", ["hot", "-0.5"])
+def test_bad_temperature_env_raises(live, monkeypatch, bad):
+    monkeypatch.setenv("LLM_TEMPERATURE", bad)
+    with pytest.raises(RuntimeError, match="LLM_TEMPERATURE"):
+        llm.complete("s", "u")
+
+
+@pytest.mark.parametrize("param,other", [("seed", "temperature"), ("temperature", "seed")])
+def test_param_400_retries_once_without_only_that_param(live, param, other):
+    script, calls, sleeps, log = live
+    script["prim"] = [_param_400(param), "ok without"]
+    script["fb-model"] = ["should not be used"]
+    assert llm.complete("s", "u") == "ok without"
+    assert calls == [("http://primary", "prim")] * 2 and sleeps == []
+    assert param in KWARGS[0] and param not in KWARGS[1]
+    assert other in KWARGS[1]
+    assert KWARGS[1]["extra_body"] == {"reasoning_effort": "low"}  # untouched
+    recs = _log(log)
+    assert recs[0][f"{param}_dropped"] is True
+    assert recs[1][param] is None and recs[1]["response"] == "ok without"
+
+
+def test_param_400_only_dropped_once_then_falls_back(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_param_400("seed"), _param_400("seed")]
+    script["fb-model"] = ["fb ok"]
+    assert llm.complete("s", "u") == "fb ok"
+    assert calls == [("http://primary", "prim")] * 2 + [("http://fb", "fb-model")]
+    recs = _log(log)
+    assert [r.get("seed_dropped", False) for r in recs] == [True, False, False]
+    assert KWARGS[2]["seed"] == 42  # fallback starts fresh
+
+
+def test_two_params_dropped_in_sequence(live):
+    script, calls, sleeps, log = live
+    script["prim"] = [_param_400("temperature"), _param_400("seed"), "ok"]
+    assert llm.complete("s", "u") == "ok"
+    assert "temperature" not in KWARGS[2] and "seed" not in KWARGS[2]
+    recs = _log(log)
+    assert recs[0]["temperature_dropped"] and recs[1]["seed_dropped"]
+
+
+def test_seed_not_matched_inside_other_words(live):
+    script, calls, sleeps, log = live
+    body = {"error": {"message": "max_tokens exceeds limit; seeded_value unknown"}}
+    script["prim"] = [_status_err(400, body=body)]
+    script["fb-model"] = ["fb ok"]
+    assert llm.complete("s", "u") == "fb ok"
+    assert calls == [("http://primary", "prim"), ("http://fb", "fb-model")]
+    assert "seed_dropped" not in _log(log)[0]
+    assert KWARGS[0]["seed"] == 42

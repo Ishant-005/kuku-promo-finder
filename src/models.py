@@ -109,3 +109,4 @@ class ExtractionResult(BaseModel):
     model: str | None = None
     response_model: str | None = None  # server-reported model name
     prompt_hash: str | None = None
+    id_retry: bool = False  # re-asked once after an all-unknown_id miss

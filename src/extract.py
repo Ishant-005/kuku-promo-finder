@@ -18,6 +18,7 @@ from .models import (
 )
 
 PROMPT_PATH = config.ROOT / "prompts" / "extract.md"
+ID_RETRY_PROMPT_PATH = config.ROOT / "prompts" / "extract_id_retry.md"
 TEXT_MAX = 160
 MIN_S, MAX_S = 20.0, 60.0
 # Only OTHER (SOUND FX in the source format) may not open a clip. CAMERA beats
@@ -55,6 +56,17 @@ class ExtractionError(Exception):
 
 def load_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def load_id_retry_note() -> str:
+    return ID_RETRY_PROMPT_PATH.read_text(encoding="utf-8").strip()
+
+
+def needs_id_retry(result: ExtractionResult) -> bool:
+    """Zero accepted candidates and at least one unknown_id rejection."""
+    return not result.accepted and any(
+        (c.reject_reason or "").startswith(R_UNKNOWN_ID) for c in result.rejected
+    )
 
 
 def _trim(text: str, n: int = TEXT_MAX) -> str:
@@ -259,11 +271,21 @@ def validate_response(raw: str, episode: Episode) -> ExtractionResult:
 
 def extract_episode(episode: Episode, *, max_tokens: int | None = None) -> ExtractionResult:
     """One LLM call for the episode, then code-side validation and dedupe.
+
+    If nothing was accepted and at least one candidate used an unknown beat id,
+    re-ask once with the same prompt plus the id-retry note appended to the
+    system prompt; the retry's result replaces the first (id_retry=True).
+    prompt_hash stays the hash of the original prompt.
     max_tokens=None uses LLM_MAX_TOKENS (default 3000)."""
     system, user = load_prompt(), build_user_message(episode)
     kw = {} if max_tokens is None else {"max_tokens": max_tokens}
     raw = llm.complete(system, user, json_mode=True, **kw)
-    result = dedupe_accepted(validate_response(raw, episode))
+    result = validate_response(raw, episode)
+    if needs_id_retry(result):
+        raw = llm.complete(f"{system}\n\n{load_id_retry_note()}", user, json_mode=True, **kw)
+        result = validate_response(raw, episode)
+        result.id_retry = True
+    result = dedupe_accepted(result)
     result.model = llm.last_model  # actual responder (may be the fallback)
     result.response_model = llm.last_response_model
     result.prompt_hash = llm._prompt_hash(system, user)

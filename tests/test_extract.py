@@ -368,3 +368,66 @@ def test_dedupe_compares_against_kept_only():
                    _cand([(2, 7)], hook_score=5)])
     assert [c.candidate_id for c in res.accepted] == ["e007-c2", "e007-c3"]
     assert _reasons(res) == {"e007-c1": "duplicate_of:e007-c3"}
+
+
+# --- id retry: re-ask once when every candidate failed and one used a bad id --
+
+_BAD_ID = {**_cand([(2, 7)]), "segments": [{"start_id": "e007-b002", "end_id": "e007-b099"}]}
+_GOOD = {"candidates": [_cand([(2, 7)])]}
+
+
+def _scripted(monkeypatch, responses):
+    calls = []
+
+    def fake_complete(system, user, **kw):
+        calls.append({"system": system, "user": user, "kw": kw})
+        extract.llm.last_model = "m"
+        extract.llm.last_response_model = "m"
+        return json.dumps(responses[len(calls) - 1])
+
+    monkeypatch.setattr(extract.llm, "complete", fake_complete)
+    return calls
+
+
+def test_id_retry_fires_and_uses_second_response(monkeypatch):
+    calls = _scripted(monkeypatch, [{"candidates": [_BAD_ID, _cand([(2, 4)])]}, _GOOD])
+    res = extract.extract_episode(_ep())
+    assert len(calls) == 2
+    assert res.id_retry is True
+    assert [c.candidate_id for c in res.accepted] == ["e007-c1"] and not res.rejected
+    note = extract.load_id_retry_note()
+    assert "e001-b017" in note
+    assert calls[0]["system"] == extract.load_prompt()
+    assert calls[1]["system"] == extract.load_prompt() + "\n\n" + note
+    assert calls[1]["user"] == calls[0]["user"] and calls[1]["kw"] == calls[0]["kw"]
+    # prompt_hash is the original prompt's
+    assert res.prompt_hash == extract.llm._prompt_hash(extract.load_prompt(), calls[0]["user"])
+    assert json.loads(res.model_dump_json())["id_retry"] is True
+
+
+def test_no_retry_when_zero_accepted_but_no_unknown_id(monkeypatch):
+    calls = _scripted(monkeypatch, [{"candidates": [_cand([(2, 4)])]}])  # too short
+    res = extract.extract_episode(_ep())
+    assert len(calls) == 1 and res.id_retry is False and not res.accepted
+
+
+def test_no_retry_when_something_accepted(monkeypatch):
+    calls = _scripted(monkeypatch, [{"candidates": [_BAD_ID, _cand([(2, 7)])]}])
+    res = extract.extract_episode(_ep())
+    assert len(calls) == 1 and res.id_retry is False
+    assert len(res.accepted) == 1 and res.rejected[0].reject_reason.startswith("unknown_id")
+
+
+def test_no_retry_on_empty_candidates(monkeypatch):
+    calls = _scripted(monkeypatch, [{"candidates": []}])
+    res = extract.extract_episode(_ep())
+    assert len(calls) == 1 and res.id_retry is False
+
+
+def test_id_retry_only_once_even_if_retry_also_fails(monkeypatch):
+    calls = _scripted(monkeypatch, [{"candidates": [_BAD_ID]}, {"candidates": [_BAD_ID]},
+                                    _GOOD])
+    res = extract.extract_episode(_ep())
+    assert len(calls) == 2
+    assert res.id_retry is True and not res.accepted
+    assert res.rejected[0].reject_reason.startswith("unknown_id")
